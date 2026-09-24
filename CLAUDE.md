@@ -6,7 +6,7 @@ Code agent running per directory under `AGENTS_ROOT`, each an interactive
 the same conversation on every start. See README.md.
 
 ```
-claude-agents                  the program (run, list, attach, new, fork, stop,
+claude-agents                  the program (run, list, attach, new, fork, adopt, stop,
                                start, restart, retire, revive)
 claude-agents.service          systemd unit (runs `claude-agents run`)
 config.example.env             host-wide settings; AGENTS_* are ours, the rest

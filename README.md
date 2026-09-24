@@ -61,6 +61,8 @@ claude-agents start NAME                  let it run again (resuming its convers
 claude-agents restart NAME                clean stop; the supervisor resumes it at once
 claude-agents retire NAME                 stop it and move it to AGENTS_ROOT/.retired
 claude-agents revive NAME                 move it back; it resumes where it left off
+claude-agents adopt NAME (--session ID | --dir PATH) [--move] [--dry-run]
+                                          take over a session running elsewhere
 ```
 
 `mkdir`, `git worktree add` and `ln -s` in `AGENTS_ROOT` work as well as
@@ -108,30 +110,59 @@ command, or ask an agent to.
    Claude session on the machine.
 4. `systemctl enable --now claude-agents`.
 
-## Moving an existing session in
+## Adopting existing sessions
 
-A session running elsewhere, under the Remote Control server included, moves
-in with its conversation:
+`adopt` takes over a session that runs elsewhere, the Remote Control
+server's sessions included, with its conversation:
 
-1. Stop it where it runs now. One conversation must not run in two
-   processes.
-2. If its directory can stay where it is: `claude-agents new NAME --dir <it>`.
-   Otherwise copy its conversation (`~/.claude/projects/<slug>/<id>.jsonl`, and
-   the `<id>/` directory beside it) to the slug of the new directory. The slug
-   is the path with every non-alphanumeric character replaced by `-`. Then
-   create the entry.
-3. If the directory may hold several conversations, first pin the right one
-   in `~/.local/state/claude-agents/agents/NAME.json` as
-   `{"session": "<id>"}`.
+```
+claude-agents adopt reviewer --session 3f2a…          # or --dir <its directory>
+claude-agents adopt reviewer --session 3f2a… --move   # relocate it into AGENTS_ROOT
+claude-agents adopt reviewer --session 3f2a… --dry-run
+```
 
-It comes back as a new claude.ai session with the same conversation and
-session ID. Use it from then on: sending to the old one would start that up
-again as a separate copy.
+It finds the session's directory, and the process running it, from Claude
+Code's session files (`~/.claude/sessions/*.json` lists every running
+session's ID, directory and name). Then it:
+
+1. checks everything that could go wrong, before touching anything;
+2. stops that process (`SIGTERM`, then `SIGKILL` after 30 s), so the
+   conversation never runs in two processes;
+3. pins the session, and with `--move` files a copy of the conversation under
+   the new path;
+4. makes the entry: a symlink to the directory, or with `--move` the
+   directory itself, moved into `AGENTS_ROOT`. A git worktree is moved by
+   git, keeping its branch and any uncommitted work, and is unlocked first:
+   the Remote Control server locks its worktrees. The supervisor then resumes
+   it within seconds.
+
+**`--move` or not?** For a session of the Remote Control server, move it.
+Afterwards, that server's copy of the session has no directory to run in, so
+a stray message to the old session in the app cannot quietly start a second
+copy of the conversation beside the adopted one. Nothing is left depending on
+what the server does with its worktrees. A symlink leaves the directory
+where it is. That's right for directories you own, and the only option for a
+repository's main checkout, or across filesystems (`git worktree move`
+cannot cross them; `adopt` says so before stopping anything).
+
+**An agent can adopt itself** (`claude-agents adopt NAME --dir "$PWD"
+--move`): `adopt` sees it is running inside the session it stops, detaches,
+lets the current reply finish (`--grace`, 10 s), and carries on in the
+background, logging to `~/.local/state/claude-agents/adopt-NAME.log`.
+
+If the last step fails, `adopt` undoes what it prepared. The session is
+left stopped where it was, and resumes there as before.
+
+The adopted agent comes back as a new claude.ai session, with the same
+conversation and session ID. Use it from then on.
 
 ## Tests
 
 `python3 -m pytest tests` (standard library only; needs pytest and git).
-These cover what the supervisor decides. It has also been exercised end to
-end under systemd (Claude Code 2.1.281): adding agents, channel delivery,
-forks, supervisor restart, `kill -9` of an agent, and retiring by removing a
-directory.
+These cover what the supervisor decides, and `adopt`/`retire` against real
+git worktrees. It has also been exercised end to end under systemd (Claude
+Code 2.1.281): adding agents, channel delivery, forks, supervisor restart,
+`kill -9` of an agent, retiring, adopting a session from outside by symlink,
+and a session in a locked worktree adopting itself with `--move`. In each
+case the agent came back with the same session ID and remembered what it
+had been told.

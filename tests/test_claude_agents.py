@@ -214,3 +214,140 @@ def test_retire_moves_a_git_worktree_with_git(home: Path, quiet) -> None:
     listed = subprocess.run(["git", "-C", str(repo), "worktree", "list"],
                             capture_output=True, text=True).stdout
     assert str((root / "wt").resolve()) in listed
+
+
+# --- adopt ---------------------------------------------------------------------------
+
+
+def _session_file(pid: int, session: str, cwd: Path) -> None:
+    d = ca.claude_home() / "sessions"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{pid}.json").write_text(json.dumps({"pid": pid, "sessionId": session, "cwd": str(cwd)}))
+
+
+def _adopt_args(name, session=None, dir=None, move=False, dry_run=False):
+    return _args(name=name, session=session, dir=dir, move=move, grace=0.0, wait=0.0,
+                 dry_run=dry_run)
+
+
+def test_find_session_live_then_from_its_records(home: Path) -> None:
+    work = home / "work"
+    work.mkdir()
+    _conversation(work, "s1")
+    t = ca.project_dir(work) / "s1.jsonl"
+    t.write_text('{"type":"summary"}\n' + json.dumps({"type": "user", "cwd": str(work)}) + "\n")
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        _session_file(proc.pid, "s1", work)
+        assert ca.find_session("s1") == ([proc.pid], work)
+    finally:
+        proc.kill()
+        proc.wait()
+    # Not running any more: the directory still comes from the conversation.
+    assert ca.find_session("s1") == ([], work)
+    assert ca.find_session("nope") == ([], None)
+
+
+def test_adopt_by_symlink_stops_the_old_process_and_pins_the_session(home: Path, monkeypatch) -> None:
+    monkeypatch.setattr(ca, "pane", lambda name: None)
+    work = home / "work"
+    work.mkdir()
+    _conversation(work, "s1")
+    proc = subprocess.Popen(["sleep", "30"])
+    _session_file(proc.pid, "s1", work)
+    root = home / "agents"
+    ca.cmd_adopt(ca.Config(root=root), _adopt_args("reviewer", session="s1"))
+    assert proc.wait(timeout=5) is not None  # stopped
+    assert (root / "reviewer").is_symlink() and (root / "reviewer").resolve() == work.resolve()
+    assert ca.load_state("reviewer") == {"session": "s1", "adopted_from": str(work.resolve())}
+    # Nothing moved or copied.
+    assert (ca.project_dir(work) / "s1.jsonl").exists()
+
+
+def test_adopt_move_relocates_a_locked_worktree_and_its_conversation(home: Path, monkeypatch) -> None:
+    monkeypatch.setattr(ca, "pane", lambda name: None)
+    repo = home / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    wt = repo / ".claude" / "worktrees" / "bridge-cse_X"
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "--lock", str(wt)], check=True)
+    (wt / "uncommitted.txt").write_text("keep me")
+    _conversation(wt, "s1")
+    root = home / "agents"
+    ca.cmd_adopt(ca.Config(root=root), _adopt_args("sre", dir=str(wt), move=True))
+    moved = (root / "sre").resolve()
+    assert not (root / "sre").is_symlink() and (moved / "uncommitted.txt").read_text() == "keep me"
+    listed = subprocess.run(["git", "-C", str(repo), "worktree", "list"],
+                            capture_output=True, text=True).stdout
+    assert str(moved) in listed and str(wt) not in listed
+    # The conversation is filed under the new path, so --resume finds it there.
+    assert ca.has_transcript(moved, "s1")
+    assert ca.load_state("sre")["session"] == "s1"
+
+
+def test_adopt_refuses_to_move_a_main_checkout(home: Path, monkeypatch) -> None:
+    monkeypatch.setattr(ca, "pane", lambda name: None)
+    repo = home / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    _conversation(repo, "s1")
+    with pytest.raises(SystemExit, match="main checkout"):
+        ca.cmd_adopt(ca.Config(root=home / "agents"), _adopt_args("x", dir=str(repo), move=True))
+    assert not (home / "agents" / "x").exists()
+
+
+def test_adopt_move_problems_are_found_before_anything_is_stopped(home: Path, monkeypatch) -> None:
+    monkeypatch.setattr(ca, "pane", lambda name: None)
+    work = home / "work"
+    work.mkdir()
+    _conversation(work, "s1")
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        _session_file(proc.pid, "s1", work)
+        monkeypatch.setattr(ca, "_move_problem", lambda src, root: "different filesystems")
+        with pytest.raises(SystemExit, match="different filesystems"):
+            ca.cmd_adopt(ca.Config(root=home / "agents"), _adopt_args("x", session="s1", move=True))
+        assert proc.poll() is None  # still running: nothing was stopped
+        assert ca.load_state("x") == {}
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_a_failed_move_is_rolled_back_and_the_worktree_relocked(home: Path, monkeypatch) -> None:
+    monkeypatch.setattr(ca, "pane", lambda name: None)
+    repo = home / "repo"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    wt = repo / "wt"
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "--lock", str(wt)], check=True)
+    _conversation(wt, "s1")
+    root = home / "agents"
+    root.mkdir(exist_ok=True)
+    root.chmod(0o555)  # passes the checks; git's move into it then fails
+    try:
+        with pytest.raises(SystemExit, match="Nothing was adopted"):
+            ca.cmd_adopt(ca.Config(root=root), _adopt_args("sre", dir=str(wt), move=True))
+    finally:
+        root.chmod(0o755)
+    assert ca.load_state("sre") == {}
+    assert wt.is_dir() and ca.has_transcript(wt, "s1")  # left where it was
+    assert not (ca.project_dir((root / "sre").resolve()) / "s1.jsonl").exists()
+    assert ca._is_locked(str(repo), wt)  # locked again, as the server left it
+
+
+def test_adopt_dry_run_changes_nothing(home: Path, monkeypatch) -> None:
+    monkeypatch.setattr(ca, "pane", lambda name: None)
+    work = home / "work"
+    work.mkdir()
+    _conversation(work, "s1")
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        _session_file(proc.pid, "s1", work)
+        ca.cmd_adopt(ca.Config(root=home / "agents"), _adopt_args("x", session="s1", dry_run=True))
+        assert proc.poll() is None and ca.load_state("x") == {}
+        assert not (home / "agents" / "x").exists()
+    finally:
+        proc.kill()
+        proc.wait()

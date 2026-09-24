@@ -33,6 +33,8 @@ Commands::
     claude-agents stop NAME / start NAME    pause an agent / let it run again
     claude-agents retire NAME               stop it and move it to AGENTS_ROOT/.retired
     claude-agents revive NAME               move it back; it resumes its conversation
+    claude-agents adopt NAME (--session ID | --dir PATH) [--move]
+                                            take over a session running elsewhere
 
 Settings: ~/.config/claude-agents/config.env (see config.example.env).
 """
@@ -497,6 +499,245 @@ def cmd_revive(cfg: Config, args) -> None:
     print(f"Revived {args.name}; it resumes its conversation within {cfg.poll:.0f}s.")
 
 
+# --- adopting a session that runs elsewhere ------------------------------------------
+
+
+def _alive(pid: int) -> bool:
+    """Running, as opposed to gone or a zombie waiting to be reaped."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return True
+
+
+def _cwd_of_transcript(path: Path) -> Path | None:
+    """The directory a conversation ran in, from its records."""
+    try:
+        with path.open() as f:
+            for line in f:
+                try:
+                    cwd = json.loads(line).get("cwd")
+                except ValueError:
+                    continue
+                if cwd:
+                    return Path(cwd)
+    except OSError:
+        pass
+    return None
+
+
+def find_session(session: str) -> tuple[list[int], Path | None]:
+    """Processes running ``session`` now, and the directory it runs (or ran) in."""
+    pids, cwd = [], None
+    for f in (claude_home() / "sessions").glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if d.get("sessionId") == session and _alive(int(d.get("pid", 0))):
+            pids.append(int(d["pid"]))
+            cwd = Path(d["cwd"]) if d.get("cwd") else cwd
+    if cwd is None:
+        for t in (claude_home() / "projects").glob(f"*/{session}.jsonl"):
+            cwd = _cwd_of_transcript(t)
+            if cwd:
+                break
+    return pids, cwd
+
+
+def session_in(real: Path) -> tuple[str | None, list[int]]:
+    """The session running in ``real``, else the newest conversation there."""
+    for f in (claude_home() / "sessions").glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if d.get("cwd") and Path(d["cwd"]).resolve() == real and _alive(int(d.get("pid", 0))):
+            return d["sessionId"], [int(d["pid"])]
+    return newest_session(real), []
+
+
+def _ancestors() -> set[int]:
+    pids, pid = set(), os.getpid()
+    while pid > 1:
+        pids.add(pid)
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return pids
+
+
+def _detach(log_path: Path) -> None:
+    """Carry on in the background, outliving the session that ran us."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    if os.fork():
+        os._exit(0)
+    os.setsid()
+    if os.fork():
+        os._exit(0)
+    out = os.open(str(log_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    null = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(null, 0)
+    os.dup2(out, 1)
+    os.dup2(out, 2)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+
+def _stop_process(pid: int, wait: float = 30.0) -> None:
+    log(f"stopping process {pid}")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.monotonic() + wait
+    while time.monotonic() < deadline and _alive(pid):
+        time.sleep(0.5)
+    if _alive(pid):
+        log(f"process {pid} still running; SIGKILL")
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(1)
+
+
+def _copy_conversation(session: str, src_dir: Path, dst_dir: Path) -> None:
+    src, dst = project_dir(src_dir), project_dir(dst_dir)
+    dst.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src / f"{session}.jsonl", dst / f"{session}.jsonl")
+    if (src / session).is_dir():
+        shutil.copytree(src / session, dst / session, dirs_exist_ok=True)
+
+
+def _move_problem(src: Path, root: Path) -> str | None:
+    """Why ``src`` can't be moved into ``root``, checked before anything is stopped."""
+    if (src / ".git").is_dir():
+        return f"{src} is a repository's main checkout; adopt it without --move"
+    root.mkdir(parents=True, exist_ok=True)
+    if src.stat().st_dev != root.stat().st_dev:
+        return (f"{src} and {root} are on different filesystems, which git worktree move "
+                f"cannot cross; adopt it without --move, or keep AGENTS_ROOT on the same one")
+    return None
+
+
+def _worktree_repo(src: Path) -> str | None:
+    if not (src / ".git").is_file():
+        return None
+    common = subprocess.run(["git", "-C", str(src), "rev-parse", "--path-format=absolute",
+                             "--git-common-dir"], capture_output=True, text=True).stdout.strip()
+    return str(Path(common).parent)
+
+
+def _is_locked(repo: str, src: Path) -> bool:
+    out = subprocess.run(["git", "-C", repo, "worktree", "list", "--porcelain"],
+                         capture_output=True, text=True).stdout
+    for block in out.split("\n\n"):
+        lines = block.splitlines()
+        if lines and Path(lines[0].removeprefix("worktree ")).resolve() == src.resolve():
+            return any(line == "locked" or line.startswith("locked ") for line in lines)
+    return False
+
+
+def _relocate(src: Path, dst: Path) -> None:
+    """Move an adopted directory into AGENTS_ROOT (a worktree, via git)."""
+    repo = _worktree_repo(src)
+    if repo is None:
+        src.rename(dst)
+        return
+    # The Remote Control server locks the worktrees it creates.
+    locked = _is_locked(repo, src)
+    if locked:
+        subprocess.run(["git", "-C", repo, "worktree", "unlock", str(src)], capture_output=True)
+    r = subprocess.run(["git", "-C", repo, "worktree", "move", str(src), str(dst)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        if locked:
+            subprocess.run(["git", "-C", repo, "worktree", "lock", str(src)], capture_output=True)
+        raise RuntimeError(f"git worktree move failed: {r.stderr.strip()}")
+
+
+def cmd_adopt(cfg: Config, args) -> None:
+    if not NAME_RE.match(args.name):
+        sys.exit(f"claude-agents: {args.name!r} is not a usable name (letters, digits, . _ -)")
+    entry = cfg.root / args.name
+    if entry.exists() or entry.is_symlink():
+        sys.exit(f"claude-agents: {entry} already exists")
+    if args.session:
+        session = args.session
+        pids, cwd = find_session(session)
+        if cwd is None:
+            sys.exit(f"claude-agents: no session {session} found")
+        real = cwd.resolve()
+    else:
+        real = Path(args.dir).expanduser().resolve()
+        session, pids = session_in(real)
+        if not session:
+            sys.exit(f"claude-agents: no conversation found in {real}")
+    if not has_transcript(real, session):
+        sys.exit(f"claude-agents: session {session} has no conversation under {real}")
+    root = cfg.root.resolve()
+    if real == root or root in real.parents:
+        sys.exit(f"claude-agents: {real} is already under {cfg.root}")
+    if args.move and (problem := _move_problem(real, cfg.root)):
+        sys.exit(f"claude-agents: {problem}")
+    target = entry if args.move else real
+    print(f"Adopting session {session} from {real} as {args.name}"
+          + (f", moving it to {entry}" if args.move else f" ({entry} -> {real})")
+          + (f"; stopping process {', '.join(map(str, pids))}" if pids else "") + ".")
+
+    adopting_self = bool(set(pids) & _ancestors())
+    if args.dry_run:
+        print("Dry run: checks passed; nothing done."
+              + (" This is the session being adopted: it would carry on in the background."
+                 if adopting_self else ""))
+        return
+    if adopting_self:
+        # We are running inside the session we adopt: stopping it would stop us.
+        log_path = state_dir() / f"adopt-{args.name}.log"
+        print(f"This is the session being adopted: carrying on in the background in "
+              f"{args.grace:.0f}s, once this reply has finished. Log: {log_path}", flush=True)
+        _detach(log_path)
+        time.sleep(args.grace)
+    for pid in pids:
+        _stop_process(pid)
+    if any(_alive(p) for p in pids):
+        sys.exit("claude-agents: the session is still running; not adopting it")
+
+    # The conversation and the pinned session are in place before the entry
+    # appears, so the supervisor never starts the agent without them.
+    if args.move:
+        _copy_conversation(session, real, target)
+    save_state(args.name, {"session": session, "adopted_from": str(real)})
+    try:
+        if args.move:
+            _relocate(real, entry)
+        else:
+            entry.symlink_to(real)
+    except (OSError, RuntimeError) as exc:
+        # Undo what was prepared; the session stays where it was, stopped.
+        (state_dir() / "agents" / f"{args.name}.json").unlink(missing_ok=True)
+        if args.move:
+            copied = project_dir(target)
+            (copied / f"{session}.jsonl").unlink(missing_ok=True)
+            shutil.rmtree(copied / session, ignore_errors=True)
+        sys.exit(f"claude-agents: could not create {entry}: {exc}. Nothing was adopted; "
+                 f"the session is stopped and can be resumed where it was.")
+    log(f"adopted {session} as {args.name}")
+    deadline = time.monotonic() + args.wait
+    while time.monotonic() < deadline:
+        p = pane(args.name)
+        if p and not p.dead and live_session(p.pid) == session:
+            log(f"{args.name} is running under the supervisor, resuming {session}")
+            return
+        time.sleep(2)
+    if args.wait:
+        log(f"{args.name}: not seen running yet; check `claude-agents list` and the supervisor's log")
+
+
 def cmd_restart(cfg: Config, args) -> None:
     _agent(cfg, args.name)
     stop(args.name)
@@ -513,6 +754,17 @@ def main(argv: list[str] | None = None) -> None:
     p = sub.add_parser("new")
     p.add_argument("name")
     p.add_argument("--dir")
+    p = sub.add_parser("adopt")
+    p.add_argument("name")
+    g = p.add_mutually_exclusive_group(required=True)
+    g.add_argument("--session")
+    g.add_argument("--dir")
+    p.add_argument("--move", action="store_true")
+    p.add_argument("--grace", type=float, default=10.0,
+                   help="seconds to wait before stopping, when adopting the session running us")
+    p.add_argument("--dry-run", action="store_true", help="check and show the plan; change nothing")
+    p.add_argument("--wait", type=float, default=60.0,
+                   help="seconds to wait for the supervisor to start it (0: don't)")
     p = sub.add_parser("fork")
     p.add_argument("parent")
     p.add_argument("child")
@@ -524,7 +776,7 @@ def main(argv: list[str] | None = None) -> None:
     else:
         {"list": cmd_list, "attach": cmd_attach, "new": cmd_new, "fork": cmd_fork,
          "restart": cmd_restart, "stop": cmd_stop, "start": cmd_start,
-         "retire": cmd_retire, "revive": cmd_revive}[args.cmd](cfg, args)
+         "retire": cmd_retire, "revive": cmd_revive, "adopt": cmd_adopt}[args.cmd](cfg, args)
 
 
 if __name__ == "__main__":
