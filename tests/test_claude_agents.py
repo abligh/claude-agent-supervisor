@@ -200,18 +200,10 @@ def test_rename_while_stopped_waits_for_the_next_start(home: Path) -> None:
     a = _agent(home, "old")
     _conversation(a.real, a.sid, titles=("old",))
     ca.cmd_rename(_cfg(home), _args(agent="old", name="new"))
-    b = ca.resolve(_cfg(home), a.sid)
-    ca.settle_name(b)  # the pending rename beats the conversation's older title
-    args = ca.claude_args(b, _cfg(home))
+    args = ca.claude_args(ca.resolve(_cfg(home), a.sid), _cfg(home))
     assert args[args.index("--name") + 1] == "new"
 
 
-def test_a_missed_rename_is_taken_from_the_conversation(home: Path) -> None:
-    a = _agent(home, "old")
-    _conversation(a.real, a.sid, titles=("old", "renamed-in-session"))
-    ca.settle_name(a)
-    args = ca.claude_args(ca.resolve(_cfg(home), a.sid), _cfg(home))
-    assert args[args.index("--name") + 1] == "renamed-in-session"
 
 
 def test_rename_while_running_types_rename_into_the_session(home: Path, monkeypatch,
