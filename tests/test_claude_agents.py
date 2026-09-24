@@ -441,3 +441,12 @@ def test_a_failed_move_is_rolled_back_and_the_worktree_relocked(home: Path) -> N
     assert ca.list_agents(root) == []
     assert wt.is_dir() and ca.has_transcript(wt, sid)
     assert ca._is_locked(str(repo), wt)
+
+
+def test_the_claude_ai_link_comes_from_the_conversation(home: Path) -> None:
+    a = _agent(home, "reviewer")
+    assert ca.remote_link(a.real, a.sid) is None
+    with (ca.project_dir(a.real) / f"{a.sid}.jsonl").open("a") as f:
+        for bridge in ("cse_OLD", "cse_01J8zb"):
+            f.write(json.dumps({"type": "bridge-session", "bridgeSessionId": bridge}) + "\n")
+    assert ca.remote_link(a.real, a.sid) == "https://claude.ai/code/session_01J8zb"

@@ -224,6 +224,27 @@ def session_title(real: Path, session: str) -> str | None:
     return title
 
 
+def remote_link(real: Path, session: str) -> str | None:
+    """The claude.ai link for the session's Remote Control session: its
+    conversation records it as a ``bridge-session`` entry (cse_X is
+    claude.ai/code/session_X). Reading the terminal instead fails once the
+    startup banner has been redrawn away."""
+    bridge = None
+    try:
+        with (project_dir(real) / f"{session}.jsonl").open() as f:
+            for line in f:
+                if '"bridge-session"' in line:
+                    try:
+                        bridge = json.loads(line).get("bridgeSessionId") or bridge
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    if bridge and bridge.startswith("cse_"):
+        return f"https://claude.ai/code/session_{bridge[4:]}"
+    return None
+
+
 def settle_name(agent: Agent) -> None:
     """Before a start: the conversation's own latest name beats the JSON (a
     rename the supervisor missed), unless ``rename`` set a new one meanwhile."""
@@ -678,9 +699,9 @@ def cmd_list(cfg: Config, _args) -> None:
         status = "not running" if p is None else ("exited" if p.dead else "running")
         if a.meta.get("stopped"):
             status = "stopped"
-        link = ""
-        if p:
-            links = LINK_RE.findall(tmux("capture-pane", "-p", "-S", "-5000",
+        link = remote_link(a.real, a.sid) or ""
+        if not link and p:
+            links = LINK_RE.findall(tmux("capture-pane", "-p", "-S", "-",
                                          "-t", f"={a.sid}:").stdout)
             link = links[-1] if links else ""
         where = f"{a.worktree} -> {a.real}" if a.worktree.is_symlink() else str(a.real)
