@@ -204,10 +204,41 @@ def newest_session(real: Path) -> str | None:
     return files[-1].stem if files else None
 
 
+def session_title(real: Path, session: str) -> str | None:
+    """The session's current name, as its conversation records it: Claude Code
+    appends a ``custom-title`` entry for every naming and rename."""
+    title = None
+    try:
+        with (project_dir(real) / f"{session}.jsonl").open() as f:
+            for line in f:
+                if '"custom-title"' not in line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") == "custom-title" and d.get("customTitle"):
+                    title = d["customTitle"]
+    except OSError:
+        pass
+    return title
+
+
+def settle_name(agent: Agent) -> None:
+    """Before a start: the conversation's own latest name beats the JSON (a
+    rename the supervisor missed), unless ``rename`` set a new one meanwhile."""
+    if agent.meta.get("rename_pending"):
+        return
+    title = session_title(agent.real, agent.sid)
+    if title and title != agent.meta.get("name"):
+        log(f"{agent.name}: its conversation says it is now called {title}")
+        agent.update(name=title)
+
+
 def claude_args(agent: Agent, cfg: Config) -> list[str]:
     name = agent.name
-    # --name every time: the JSON follows the live session's name, so this
-    # never undoes a rename — and it applies one made while the agent was down.
+    # --name every time, after settle_name: it never undoes a rename, and it
+    # applies one made with `rename` while the agent was stopped.
     args = [cfg.claude, "--remote-control", name, "--name", name]
     if cfg.channels:
         args += ["--channels", *cfg.channels]
@@ -291,7 +322,9 @@ def convert_legacy(cfg: Config, entry: Path) -> None:
     sid = sid or newest_session(real)
     if not sid:
         sid = str(uuid.uuid4())  # never ran: it simply starts afresh under its new ID
-    stop(name)  # the old layout's tmux session was named after the agent
+    p = pane(name)  # the old layout's tmux session was named after the agent
+    live = live_session(p.pid) if p and not p.dead else {}
+    stop(name)
     wt = cfg.root / f"{sid}.worktree"
     if entry.is_symlink():
         entry.rename(wt)  # the target, and so the conversation's folder, stay put
@@ -299,7 +332,10 @@ def convert_legacy(cfg: Config, entry: Path) -> None:
         if has_transcript(real, sid):
             _copy_conversation(sid, real, wt)  # filed under the new path first
         _relocate(entry, wt)
-    meta = {"name": name}
+    # Its name is the session's, not the old directory's: live if it was
+    # running, else as the conversation last recorded it.
+    title = (live.get("name") if live.get("sessionId") == sid else None) or session_title(real, sid)
+    meta = {"name": title or name}
     for k in ("adopted_from", "stopped"):
         if old_state.get(k):
             meta[k] = old_state[k]
@@ -425,8 +461,11 @@ class Supervisor:
             if now < self.not_before.get(sid, 0):
                 continue
             try:
+                settle_name(agent)
                 start(agent, self.cfg)
                 self.started_at[sid] = now
+                if agent.meta.get("rename_pending"):
+                    agent.update(rename_pending=None)
             except (RuntimeError, OSError) as exc:
                 log(f"{agent.name}: could not start: {exc}")
                 self.not_before[sid] = now + 60
@@ -691,7 +730,7 @@ def cmd_rename(cfg: Config, args) -> None:
         tmux("send-keys", "-t", f"={a.sid}:", "Enter")
         print(f"Renaming {a.name} to {args.name} in its session.")
     else:
-        a.update(name=args.name)
+        a.update(name=args.name, rename_pending=True)
         print(f"Renamed {a.name} to {args.name}; its session takes the name when it next starts.")
 
 

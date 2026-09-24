@@ -54,11 +54,13 @@ def _cfg(home: Path, **kw):
     return ca.Config(root=home / "agents", poll=0, **kw)
 
 
-def _conversation(real: Path, session: str, *, age: float = 0.0) -> Path:
+def _conversation(real: Path, session: str, *, age: float = 0.0, titles=()) -> Path:
     d = ca.project_dir(real.resolve())
     d.mkdir(parents=True, exist_ok=True)
     f = d / f"{session}.jsonl"
-    f.write_text(json.dumps({"type": "user", "cwd": str(real)}) + "\n")
+    lines = [{"type": "user", "cwd": str(real)}]
+    lines += [{"type": "custom-title", "customTitle": t, "sessionId": session} for t in titles]
+    f.write_text("".join(json.dumps(x) + "\n" for x in lines))
     t = time.time() - age
     os.utime(f, (t, t))
     return f
@@ -196,8 +198,20 @@ def test_the_json_follows_the_sessions_name(home: Path, monkeypatch) -> None:
 
 def test_rename_while_stopped_waits_for_the_next_start(home: Path) -> None:
     a = _agent(home, "old")
+    _conversation(a.real, a.sid, titles=("old",))
     ca.cmd_rename(_cfg(home), _args(agent="old", name="new"))
-    assert ca.resolve(_cfg(home), a.sid).name == "new"
+    b = ca.resolve(_cfg(home), a.sid)
+    ca.settle_name(b)  # the pending rename beats the conversation's older title
+    args = ca.claude_args(b, _cfg(home))
+    assert args[args.index("--name") + 1] == "new"
+
+
+def test_a_missed_rename_is_taken_from_the_conversation(home: Path) -> None:
+    a = _agent(home, "old")
+    _conversation(a.real, a.sid, titles=("old", "renamed-in-session"))
+    ca.settle_name(a)
+    args = ca.claude_args(ca.resolve(_cfg(home), a.sid), _cfg(home))
+    assert args[args.index("--name") + 1] == "renamed-in-session"
 
 
 def test_rename_while_running_types_rename_into_the_session(home: Path, monkeypatch,
@@ -298,7 +312,8 @@ def test_the_old_layout_converts_itself(home: Path) -> None:
                    check=True)
     (root / "claude-dev" / "work.txt").write_text("keep me")
     sid = str(uuid.uuid4())
-    _conversation(root / "claude-dev", sid)
+    # Renamed in its session since: the conversation's latest title is its name.
+    _conversation(root / "claude-dev", sid, titles=("claude-dev", "claude-dev2"))
     state = home / "state" / "agents"
     state.mkdir(parents=True)
     (state / "claude-dev.json").write_text(json.dumps({"session": sid, "named": True}))
@@ -310,8 +325,8 @@ def test_the_old_layout_converts_itself(home: Path) -> None:
     ca.Supervisor(_cfg(home)).tick()
 
     agents = {a.name: a for a in ca.list_agents(root)}
-    assert set(agents) == {"claude-dev", "linked"}
-    dev = agents["claude-dev"]
+    assert set(agents) == {"claude-dev2", "linked"}
+    dev = agents["claude-dev2"]
     assert dev.sid == sid and (dev.worktree / "work.txt").read_text() == "keep me"
     assert ca.has_transcript(dev.real, sid)  # the conversation came along
     assert str(dev.real) in _worktrees(repo)
