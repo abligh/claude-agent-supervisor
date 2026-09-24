@@ -19,8 +19,8 @@ Nothing names an agent but its directory:
   so it gets its own claude.ai session (and, say, its own XMPP address).
 
 The only record this program keeps is its own, in ~/.local/state/claude-agents/:
-which session it last ran for each agent, a fork still to be started, and
-whether an agent is stopped.
+which session it last ran for each agent, a fork still to be started,
+whether an agent is stopped, and whether it has been given its name yet.
 
 Commands::
 
@@ -186,7 +186,11 @@ def session_to_resume(agent: Agent, state: dict) -> str | None:
 
 
 def claude_args(agent: Agent, cfg: Config, state: dict) -> list[str]:
-    args = [cfg.claude, "--remote-control", agent.name, "--name", agent.name]
+    args = [cfg.claude, "--remote-control", agent.name]
+    if not state.get("named"):
+        # The agent's name, once: after that the session keeps whatever it is
+        # called, so a rename (in the app, or /rename) survives restarts.
+        args += ["--name", agent.name]
     if cfg.channels:
         args += ["--channels", *cfg.channels]
     if cfg.plugins:
@@ -319,6 +323,8 @@ class Supervisor:
             try:
                 start(agent, self.cfg, state)
                 self.started_at[name] = now
+                if not state.get("named"):
+                    save_state(name, {**load_state(name), "named": True})
             except (RuntimeError, OSError) as exc:
                 log(f"{name}: could not start: {exc}")
                 self.not_before[name] = now + 60

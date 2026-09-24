@@ -118,6 +118,9 @@ def test_command_line(home: Path) -> None:
     assert resumed[resumed.index("--resume") + 1] == "s1" and "--fork-session" not in resumed
     forked = ca.claude_args(agent, cfg, {"fork_from": "p1"})
     assert forked[forked.index("--resume") + 1] == "p1" and "--fork-session" in forked
+    # Named once; after that a rename made in the session or the app sticks.
+    later = ca.claude_args(agent, cfg, {"session": "s1", "named": True})
+    assert "--name" not in later and later[later.index("--resume") + 1] == "s1"
 
 
 def test_fork_files_a_copy_of_the_parents_conversation_under_the_child(

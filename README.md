@@ -36,6 +36,8 @@ property that nothing has to be recorded per agent.
   ran there, or else the newest Claude Code keeps for that directory. Claude
   Code files conversations by directory; that is what `--resume` searches. An
   empty directory starts a new conversation.
+* **It is named once.** The first start passes `--name NAME`; after that the
+  session keeps its name, so renaming it (in the app, or `/rename`) sticks.
 * **It appears in the app by itself.** Each session registers with claude.ai
   as it starts, and after a restart it rejoins the same claude.ai session.
 * The supervisor's only state is its own, in `~/.local/state/claude-agents/`:
