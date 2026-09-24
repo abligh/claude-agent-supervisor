@@ -1,12 +1,13 @@
-"""Unit tests for claude-agents, the directory-based supervisor.
+"""Unit tests for claude-agents, the supervisor.
 
 No tmux and no Claude Code: these cover what the supervisor *decides* — which
-directories are agents, which conversation each resumes, how a fork is laid
-out, and the command line it would run.
+entries are agents, what it runs for each, how forks, renames, retirement,
+adoption and the conversion of the old layout lay things out on disk.
 """
 
 from __future__ import annotations
 
+import argparse
 import importlib.machinery
 import importlib.util
 import json
@@ -14,6 +15,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import pytest
@@ -26,6 +28,20 @@ sys.modules["claude_agents"] = ca  # dataclasses look their module up
 _loader.exec_module(ca)
 
 
+@pytest.fixture(autouse=True)
+def no_tmux(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Never touch a real tmux server: the machine running the tests may be
+    running real agents under the same socket name."""
+    calls: list = []
+
+    def fake(*args):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 1, "", "")
+
+    monkeypatch.setattr(ca, "tmux", fake)
+    return calls
+
+
 @pytest.fixture
 def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
@@ -34,18 +50,47 @@ def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return tmp_path
 
 
+def _cfg(home: Path, **kw):
+    return ca.Config(root=home / "agents", poll=0, **kw)
+
+
 def _conversation(real: Path, session: str, *, age: float = 0.0) -> Path:
-    d = ca.project_dir(real)
+    d = ca.project_dir(real.resolve())
     d.mkdir(parents=True, exist_ok=True)
     f = d / f"{session}.jsonl"
-    f.write_text('{"type":"user"}\n')
+    f.write_text(json.dumps({"type": "user", "cwd": str(real)}) + "\n")
     t = time.time() - age
     os.utime(f, (t, t))
     return f
 
 
+def _agent(home: Path, name: str, *, sid: str | None = None, conversation: bool = True, **meta):
+    a = ca.create(_cfg(home), name, sid=sid, **meta)
+    if conversation:
+        _conversation(a.real, a.sid)
+    return a
+
+
+def _args(**kw):
+    return argparse.Namespace(**kw)
+
+
+def _git_repo(path: Path) -> Path:
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@t",
+                    "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    return path
+
+
+def _worktrees(repo: Path) -> str:
+    return subprocess.run(["git", "-C", str(repo), "worktree", "list"],
+                          capture_output=True, text=True).stdout
+
+
+# --- basics ----------------------------------------------------------------------
+
+
 def test_slug_matches_claude_codes_project_folders() -> None:
-    # A real pair, as Claude Code filed a worktree's conversations.
     path = "/home/me/src/project/.claude/worktrees/bridge-cse_01Fd5gTSC"
     assert ca.slug(path) == "-home-me-src-project--claude-worktrees-bridge-cse-01Fd5gTSC"
 
@@ -71,165 +116,221 @@ def test_config_splits_own_settings_from_the_agents_environment(tmp_path: Path) 
     }
 
 
-def test_agents_are_directories_and_symlinks_to_them(home: Path) -> None:
+def test_an_agent_is_a_json_and_a_worktree_named_by_its_session(home: Path) -> None:
     root = home / "agents"
-    (root / "reviewer").mkdir()
+    a = _agent(home, "reviewer")
+    assert (root / f"{a.sid}.json").exists() and (root / f"{a.sid}.worktree").is_dir()
     (home / "elsewhere").mkdir()
-    (root / "builder").symlink_to(home / "elsewhere")
-    (root / ".hidden").mkdir()
-    (root / "notes.txt").write_text("not an agent")
-    (root / "bad name").mkdir()
-    (root / "dangling").symlink_to(home / "missing")
-    agents = {a.name: a for a in ca.list_agents(root)}
+    b = ca.create(_cfg(home), "builder", dir=str(home / "elsewhere"))
+    # Not agents: a JSON with no worktree, a stray file, a hidden entry.
+    lone = str(uuid.uuid4())
+    (root / f"{lone}.json").write_text('{"name": "lone"}')
+    (root / "notes.txt").write_text("x")
+    (root / ".retired").mkdir()
+    agents = {x.name: x for x in ca.list_agents(root)}
     assert set(agents) == {"builder", "reviewer"}
-    assert agents["builder"].real == (home / "elsewhere").resolve()
+    assert agents["builder"].real == (home / "elsewhere").resolve() and b.worktree.is_symlink()
+    with pytest.raises(SystemExit, match="already an agent called"):
+        ca.create(_cfg(home), "Reviewer")
 
 
-def test_resumes_its_own_conversation_else_the_newest(home: Path) -> None:
-    real = home / "agents" / "reviewer"
-    real.mkdir()
-    agent = ca.Agent("reviewer", real, real)
-    assert ca.session_to_resume(agent, {}) is None  # nothing yet: a new conversation
-    _conversation(real, "older", age=100)
-    _conversation(real, "newer")
-    assert ca.session_to_resume(agent, {}) == "newer"
-    # The one we last ran wins, even if something else ran there since...
-    assert ca.session_to_resume(agent, {"session": "older"}) == "older"
-    # ...unless its transcript has gone.
-    assert ca.session_to_resume(agent, {"session": "deleted"}) == "newer"
+def test_new_can_make_a_git_worktree(home: Path) -> None:
+    repo = _git_repo(home / "repo")
+    a = ca.create(_cfg(home), "sre", repo=str(repo))
+    assert str(a.worktree.resolve()) in _worktrees(repo)
+    assert subprocess.run(["git", "-C", str(a.worktree), "branch", "--show-current"],
+                          capture_output=True, text=True).stdout.strip() == "sre"
+
+
+# --- what runs ---------------------------------------------------------------------
 
 
 def test_command_line(home: Path) -> None:
-    real = home / "agents" / "reviewer"
-    real.mkdir()
-    agent = ca.Agent("reviewer", real, real)
-    bare = ca.claude_args(agent, ca.Config(root=home / "agents"), {})
-    assert bare == ["claude", "--remote-control", "reviewer", "--name", "reviewer"]
-    cfg = ca.Config(root=home / "agents", extra_args=["--model", "sonnet"],
-                    channels=["plugin:xmpp@xmpp-mcp", "plugin:other@market"])
-    fresh = ca.claude_args(agent, cfg, {})
-    assert fresh[:8] == ["claude", "--remote-control", "reviewer", "--name", "reviewer",
-                         "--channels", "plugin:xmpp@xmpp-mcp", "plugin:other@market"]
+    cfg = _cfg(home, extra_args=["--model", "sonnet"],
+               channels=["plugin:xmpp@xmpp-mcp", "plugin:other@market"])
+    a = _agent(home, "reviewer", conversation=False)
+    fresh = ca.claude_args(a, cfg)
+    assert fresh[:5] == ["claude", "--remote-control", "reviewer", "--name", "reviewer"]
+    i = fresh.index("--channels")
+    assert fresh[i + 1:i + 3] == ["plugin:xmpp@xmpp-mcp", "plugin:other@market"]
     assert json.loads(fresh[fresh.index("--settings") + 1]) == {
         "enabledPlugins": {"xmpp@xmpp-mcp": True, "other@market": True}}
-    assert "--resume" not in fresh and fresh[-2:] == ["--model", "sonnet"]
-    _conversation(real, "s1")
-    resumed = ca.claude_args(agent, cfg, {"session": "s1"})
-    assert resumed[resumed.index("--resume") + 1] == "s1" and "--fork-session" not in resumed
-    forked = ca.claude_args(agent, cfg, {"fork_from": "p1"})
-    assert forked[forked.index("--resume") + 1] == "p1" and "--fork-session" in forked
-    # Named once; after that a rename made in the session or the app sticks.
-    later = ca.claude_args(agent, cfg, {"session": "s1", "named": True})
-    assert "--name" not in later and later[later.index("--resume") + 1] == "s1"
+    # A new agent's conversation is created with its ID: the ID is known first.
+    assert fresh[fresh.index("--session-id") + 1] == a.sid and "--resume" not in fresh
+    assert fresh[-2:] == ["--model", "sonnet"]
+    _conversation(a.real, a.sid)
+    resumed = ca.claude_args(a, cfg)
+    assert resumed[resumed.index("--resume") + 1] == a.sid and "--session-id" not in resumed
+    bare = ca.claude_args(a, _cfg(home))
+    assert "--channels" not in bare and "--settings" not in bare
 
 
-def test_fork_files_a_copy_of_the_parents_conversation_under_the_child(
-    home: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(ca, "pane", lambda name: None)  # the parent is not running
-    root = home / "agents"
-    (root / "parent").mkdir()
-    parent = ca.Agent("parent", root / "parent", (root / "parent").resolve())
-    _conversation(parent.real, "p1")
-    extra = ca.project_dir(parent.real) / "p1" / "subagents"
-    extra.mkdir(parents=True)
-    (extra / "a.jsonl").write_text("{}\n")
-    ca.save_state("parent", {"session": "p1"})
+def test_resolve_by_name_id_or_prefix(home: Path) -> None:
+    a = _agent(home, "Reviewer", sid="aaaa1111-0000-4000-8000-000000000001")
+    b = _agent(home, "builder", sid="aaaa2222-0000-4000-8000-000000000002")
+    cfg = _cfg(home)
+    assert ca.resolve(cfg, "reviewer").sid == a.sid  # names ignore case
+    assert ca.resolve(cfg, b.sid).name == "builder"
+    assert ca.resolve(cfg, "aaaa2").name == "builder"
+    with pytest.raises(SystemExit, match="ambiguous"):
+        ca.resolve(cfg, "aaaa")
+    with pytest.raises(SystemExit, match="no agent"):
+        ca.resolve(cfg, "nobody")
 
-    cfg = ca.Config(root=root)
-    child = ca.prepare_fork(cfg, parent, "child", target=None)
-    assert child.real == (root / "child").resolve() and child.real.is_dir()
+
+def test_the_json_follows_the_sessions_name(home: Path, monkeypatch) -> None:
+    a = _agent(home, "claude-dev")
+    live = {"sessionId": a.sid, "name": "claude-dev2"}
+    monkeypatch.setattr(ca, "live_session", lambda pid: live)
+    sup = ca.Supervisor(_cfg(home))
+    sup._follow(a, ca.Pane(False, 1234, ""))
+    assert ca.resolve(_cfg(home), "claude-dev2").sid == a.sid
+    # The next start passes the new name, so it is not undone.
+    args = ca.claude_args(ca.resolve(_cfg(home), a.sid), _cfg(home))
+    assert args[args.index("--name") + 1] == "claude-dev2"
+    # Another session's file (a recycled PID) changes nothing.
+    live = {"sessionId": str(uuid.uuid4()), "name": "impostor"}
+    sup._follow(ca.resolve(_cfg(home), a.sid), ca.Pane(False, 1234, ""))
+    assert ca.resolve(_cfg(home), a.sid).name == "claude-dev2"
+
+
+def test_rename_while_stopped_waits_for_the_next_start(home: Path) -> None:
+    a = _agent(home, "old")
+    ca.cmd_rename(_cfg(home), _args(agent="old", name="new"))
+    assert ca.resolve(_cfg(home), a.sid).name == "new"
+
+
+def test_rename_while_running_types_rename_into_the_session(home: Path, monkeypatch,
+                                                             no_tmux) -> None:
+    a = _agent(home, "old")
+    monkeypatch.setattr(ca, "pane", lambda name: ca.Pane(False, 1234, ""))
+    ca.cmd_rename(_cfg(home), _args(agent="old", name="new"))
+    assert ("send-keys", "-t", f"={a.sid}:", "-l", "/rename new") in no_tmux
+    assert ca.resolve(_cfg(home), a.sid).name == "old"  # until the session confirms it
+
+
+def test_stop_and_start_are_kept_in_the_json(home: Path) -> None:
+    a = _agent(home, "reviewer")
+    ca.cmd_stop(_cfg(home), _args(agent="reviewer"))
+    assert ca.resolve(_cfg(home), a.sid).meta.get("stopped") is True
+    ca.cmd_start(_cfg(home), _args(agent="reviewer"))
+    assert "stopped" not in ca.resolve(_cfg(home), a.sid).meta
+
+
+# --- forks -------------------------------------------------------------------------
+
+
+def test_fork_starts_from_a_copy_of_the_parents_conversation(home: Path) -> None:
+    parent = _agent(home, "parent")
+    side = ca.project_dir(parent.real) / parent.sid / "subagents"
+    side.mkdir(parents=True)
+    (side / "a.jsonl").write_text("{}\n")
+    ca.cmd_fork(_cfg(home), _args(agent="parent", name="child", dir=None))
+    child = ca.resolve(_cfg(home), "child")
+    assert child.sid != parent.sid and child.meta["fork_from"] == parent.sid
     copied = ca.project_dir(child.real)
-    assert (copied / "p1.jsonl").read_text() == '{"type":"user"}\n'
-    assert (copied / "p1" / "subagents" / "a.jsonl").exists()
-    assert ca.load_state("child") == {"fork_from": "p1", "forked_from_agent": "parent"}
-    # The parent's own conversation is untouched.
-    assert (ca.project_dir(parent.real) / "p1.jsonl").exists()
+    assert (copied / f"{parent.sid}.jsonl").exists()
+    assert (copied / parent.sid / "subagents" / "a.jsonl").exists()
+    args = ca.claude_args(child, _cfg(home))
+    assert args[args.index("--resume") + 1] == parent.sid and "--fork-session" in args
+    assert args[args.index("--session-id") + 1] == child.sid  # its own, known ID
+    assert args[args.index("--name") + 1] == "child"
+    # Once its own conversation exists, it is resumed like any other.
+    _conversation(child.real, child.sid)
+    assert "--fork-session" not in ca.claude_args(child, _cfg(home))
 
 
-def test_fork_refuses_a_parent_with_no_conversation(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(ca, "pane", lambda name: None)
-    root = home / "agents"
-    (root / "parent").mkdir()
-    parent = ca.Agent("parent", root / "parent", (root / "parent").resolve())
+def test_fork_of_a_git_worktree_is_a_new_worktree(home: Path) -> None:
+    repo = _git_repo(home / "repo")
+    parent = ca.create(_cfg(home), "parent", repo=str(repo))
+    _conversation(parent.real, parent.sid)
+    ca.cmd_fork(_cfg(home), _args(agent="parent", name="child", dir=None))
+    child = ca.resolve(_cfg(home), "child")
+    assert str(child.worktree.resolve()) in _worktrees(repo)
+
+
+def test_fork_refuses_a_parent_with_no_conversation(home: Path) -> None:
+    _agent(home, "parent", conversation=False)
     with pytest.raises(SystemExit, match="no conversation to fork"):
-        ca.prepare_fork(ca.Config(root=root), parent, "child", target=None)
-    assert not (root / "child").exists()
+        ca.cmd_fork(_cfg(home), _args(agent="parent", name="child", dir=None))
+    assert [a.name for a in ca.list_agents(home / "agents")] == ["parent"]
 
 
-@pytest.fixture
-def quiet(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No tmux: nothing is running, and stopping is a no-op."""
-    monkeypatch.setattr(ca, "pane", lambda name: None)
-    monkeypatch.setattr(ca, "stop", lambda *names, **kw: None)
+# --- retire / revive ---------------------------------------------------------------
 
 
-def _args(**kw):
-    import argparse
-    return argparse.Namespace(**kw)
-
-
-def test_stop_and_start_are_kept_in_the_supervisors_state(home: Path, quiet) -> None:
-    root = home / "agents"
-    (root / "reviewer").mkdir()
-    cfg = ca.Config(root=root)
-    ca.save_state("reviewer", {"session": "s1"})
-    ca.cmd_stop(cfg, _args(name="reviewer"))
-    assert ca.load_state("reviewer") == {"session": "s1", "stopped": True}
-    ca.cmd_start(cfg, _args(name="reviewer"))
-    assert ca.load_state("reviewer") == {"session": "s1"}
-
-
-def test_retire_moves_aside_and_revive_brings_back(home: Path, quiet) -> None:
-    root = home / "agents"
-    (root / "reviewer").mkdir()
-    (root / "reviewer" / "work.txt").write_text("uncommitted")
+def test_retire_and_revive_keep_files_and_conversation(home: Path) -> None:
+    a = _agent(home, "reviewer")
+    (a.worktree / "work.txt").write_text("uncommitted")
     (home / "elsewhere").mkdir()
-    (root / "builder").symlink_to(home / "elsewhere")
-    cfg = ca.Config(root=root)
+    b = ca.create(_cfg(home), "builder", dir=str(home / "elsewhere"))
+    cfg = _cfg(home)
     for name in ("reviewer", "builder"):
-        ca.cmd_retire(cfg, _args(name=name))
-    assert [a.name for a in ca.list_agents(root)] == []  # .retired is hidden
-    assert (root / ".retired" / "reviewer" / "work.txt").read_text() == "uncommitted"
+        ca.cmd_retire(cfg, _args(agent=name))
+    assert ca.list_agents(home / "agents") == []
+    assert (home / "agents" / ".retired" / f"{a.sid}.worktree" / "work.txt").exists()
     assert (home / "elsewhere").is_dir()  # a symlink's target is never touched
-    for name in ("reviewer", "builder"):
-        ca.cmd_revive(cfg, _args(name=name))
-    agents = {a.name: a for a in ca.list_agents(root)}
+    for name in ("reviewer", b.sid[:6]):
+        ca.cmd_revive(cfg, _args(agent=name))
+    agents = {x.name: x for x in ca.list_agents(home / "agents")}
     assert set(agents) == {"builder", "reviewer"}
-    # Back at the same path, so its conversation is found again.
-    assert agents["reviewer"].real == (root / "reviewer").resolve()
-    assert "stopped" not in ca.load_state("reviewer")
+    back = agents["reviewer"]
+    assert ca.has_transcript(back.real, back.sid)  # found again at the same path
+    assert "stopped" not in back.meta
 
 
-def test_retire_moves_a_git_worktree_with_git(home: Path, quiet) -> None:
-    repo = home / "repo"
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
-                    "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+def test_retire_moves_a_git_worktree_with_git(home: Path) -> None:
+    repo = _git_repo(home / "repo")
+    a = ca.create(_cfg(home), "wt", repo=str(repo))
+    ca.cmd_retire(_cfg(home), _args(agent="wt"))
+    assert str((home / "agents" / ".retired" / f"{a.sid}.worktree").resolve()) in _worktrees(repo)
+    ca.cmd_revive(_cfg(home), _args(agent="wt"))
+    assert str(a.worktree.resolve()) in _worktrees(repo)
+
+
+# --- converting the old layout -----------------------------------------------------
+
+
+def test_the_old_layout_converts_itself(home: Path) -> None:
     root = home / "agents"
-    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", str(root / "wt")], check=True)
-    cfg = ca.Config(root=root)
-    ca.cmd_retire(cfg, _args(name="wt"))
-    listed = subprocess.run(["git", "-C", str(repo), "worktree", "list"],
-                            capture_output=True, text=True).stdout
-    assert str((root / ".retired" / "wt").resolve()) in listed  # git knows where it went
-    ca.cmd_revive(cfg, _args(name="wt"))
-    listed = subprocess.run(["git", "-C", str(repo), "worktree", "list"],
-                            capture_output=True, text=True).stdout
-    assert str((root / "wt").resolve()) in listed
+    repo = _git_repo(home / "repo")
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", str(root / "claude-dev")],
+                   check=True)
+    (root / "claude-dev" / "work.txt").write_text("keep me")
+    sid = str(uuid.uuid4())
+    _conversation(root / "claude-dev", sid)
+    state = home / "state" / "agents"
+    state.mkdir(parents=True)
+    (state / "claude-dev.json").write_text(json.dumps({"session": sid, "named": True}))
+    (home / "elsewhere").mkdir()
+    (root / "linked").symlink_to(home / "elsewhere")
+    linked_sid = str(uuid.uuid4())
+    _conversation(home / "elsewhere", linked_sid)
+
+    ca.Supervisor(_cfg(home)).tick()
+
+    agents = {a.name: a for a in ca.list_agents(root)}
+    assert set(agents) == {"claude-dev", "linked"}
+    dev = agents["claude-dev"]
+    assert dev.sid == sid and (dev.worktree / "work.txt").read_text() == "keep me"
+    assert ca.has_transcript(dev.real, sid)  # the conversation came along
+    assert str(dev.real) in _worktrees(repo)
+    assert not (root / "claude-dev").exists() and not (state / "claude-dev.json").exists()
+    assert agents["linked"].sid == linked_sid and agents["linked"].worktree.is_symlink()
 
 
-# --- adopt ---------------------------------------------------------------------------
+# --- adopt -------------------------------------------------------------------------
 
 
-def _session_file(pid: int, session: str, cwd: Path) -> None:
+def _session_file(pid: int, session: str, cwd: Path, name: str | None = None) -> None:
     d = ca.claude_home() / "sessions"
     d.mkdir(parents=True, exist_ok=True)
-    (d / f"{pid}.json").write_text(json.dumps({"pid": pid, "sessionId": session, "cwd": str(cwd)}))
+    (d / f"{pid}.json").write_text(json.dumps(
+        {"pid": pid, "sessionId": session, "cwd": str(cwd), "name": name}))
 
 
-def _adopt_args(name, session=None, dir=None, move=False, dry_run=False):
-    return _args(name=name, session=session, dir=dir, move=move, grace=0.0, wait=0.0,
+def _adopt_args(session=None, dir=None, name=None, move=False, dry_run=False):
+    return _args(session=session, dir=dir, name=name, move=move, grace=0.0, wait=0.0,
                  dry_run=dry_run)
 
 
@@ -237,8 +338,6 @@ def test_find_session_live_then_from_its_records(home: Path) -> None:
     work = home / "work"
     work.mkdir()
     _conversation(work, "s1")
-    t = ca.project_dir(work) / "s1.jsonl"
-    t.write_text('{"type":"summary"}\n' + json.dumps({"type": "user", "cwd": str(work)}) + "\n")
     proc = subprocess.Popen(["sleep", "30"])
     try:
         _session_file(proc.pid, "s1", work)
@@ -246,111 +345,84 @@ def test_find_session_live_then_from_its_records(home: Path) -> None:
     finally:
         proc.kill()
         proc.wait()
-    # Not running any more: the directory still comes from the conversation.
     assert ca.find_session("s1") == ([], work)
     assert ca.find_session("nope") == ([], None)
 
 
-def test_adopt_by_symlink_stops_the_old_process_and_pins_the_session(home: Path, monkeypatch) -> None:
-    monkeypatch.setattr(ca, "pane", lambda name: None)
+def test_adopt_by_symlink_stops_the_old_process_and_takes_its_name(home: Path) -> None:
     work = home / "work"
     work.mkdir()
-    _conversation(work, "s1")
+    sid = str(uuid.uuid4())
+    _conversation(work, sid)
     proc = subprocess.Popen(["sleep", "30"])
-    _session_file(proc.pid, "s1", work)
-    root = home / "agents"
-    ca.cmd_adopt(ca.Config(root=root), _adopt_args("reviewer", session="s1"))
+    _session_file(proc.pid, sid, work, name="Reviewer")
+    ca.cmd_adopt(_cfg(home), _adopt_args(session=sid))
     assert proc.wait(timeout=5) is not None  # stopped
-    assert (root / "reviewer").is_symlink() and (root / "reviewer").resolve() == work.resolve()
-    assert ca.load_state("reviewer") == {"session": "s1", "adopted_from": str(work.resolve())}
-    # Nothing moved or copied.
-    assert (ca.project_dir(work) / "s1.jsonl").exists()
+    a = ca.resolve(_cfg(home), sid)
+    assert a.name == "Reviewer" and a.worktree.is_symlink() and a.real == work.resolve()
+    assert a.meta["adopted_from"] == str(work.resolve())
+    assert "--resume" in ca.claude_args(a, _cfg(home))
 
 
-def test_adopt_move_relocates_a_locked_worktree_and_its_conversation(home: Path, monkeypatch) -> None:
-    monkeypatch.setattr(ca, "pane", lambda name: None)
-    repo = home / "repo"
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
-                    "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+def test_adopt_move_relocates_a_locked_worktree_and_its_conversation(home: Path) -> None:
+    repo = _git_repo(home / "repo")
     wt = repo / ".claude" / "worktrees" / "bridge-cse_X"
     subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "--lock", str(wt)], check=True)
     (wt / "uncommitted.txt").write_text("keep me")
-    _conversation(wt, "s1")
-    root = home / "agents"
-    ca.cmd_adopt(ca.Config(root=root), _adopt_args("sre", dir=str(wt), move=True))
-    moved = (root / "sre").resolve()
-    assert not (root / "sre").is_symlink() and (moved / "uncommitted.txt").read_text() == "keep me"
-    listed = subprocess.run(["git", "-C", str(repo), "worktree", "list"],
-                            capture_output=True, text=True).stdout
-    assert str(moved) in listed and str(wt) not in listed
-    # The conversation is filed under the new path, so --resume finds it there.
-    assert ca.has_transcript(moved, "s1")
-    assert ca.load_state("sre")["session"] == "s1"
+    sid = str(uuid.uuid4())
+    _conversation(wt, sid)
+    ca.cmd_adopt(_cfg(home), _adopt_args(dir=str(wt), name="sre", move=True))
+    a = ca.resolve(_cfg(home), "sre")
+    assert a.sid == sid and not a.worktree.is_symlink()
+    assert (a.worktree / "uncommitted.txt").read_text() == "keep me"
+    assert str(a.real) in _worktrees(repo) and str(wt) not in _worktrees(repo)
+    assert ca.has_transcript(a.real, sid)
 
 
-def test_adopt_refuses_to_move_a_main_checkout(home: Path, monkeypatch) -> None:
-    monkeypatch.setattr(ca, "pane", lambda name: None)
-    repo = home / "repo"
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    _conversation(repo, "s1")
-    with pytest.raises(SystemExit, match="main checkout"):
-        ca.cmd_adopt(ca.Config(root=home / "agents"), _adopt_args("x", dir=str(repo), move=True))
-    assert not (home / "agents" / "x").exists()
-
-
-def test_adopt_move_problems_are_found_before_anything_is_stopped(home: Path, monkeypatch) -> None:
-    monkeypatch.setattr(ca, "pane", lambda name: None)
-    work = home / "work"
-    work.mkdir()
-    _conversation(work, "s1")
+def test_adopt_refuses_a_main_checkout_move_before_stopping_anything(home: Path) -> None:
+    repo = _git_repo(home / "repo")
+    sid = str(uuid.uuid4())
+    _conversation(repo, sid)
     proc = subprocess.Popen(["sleep", "30"])
     try:
-        _session_file(proc.pid, "s1", work)
-        monkeypatch.setattr(ca, "_move_problem", lambda src, root: "different filesystems")
-        with pytest.raises(SystemExit, match="different filesystems"):
-            ca.cmd_adopt(ca.Config(root=home / "agents"), _adopt_args("x", session="s1", move=True))
-        assert proc.poll() is None  # still running: nothing was stopped
-        assert ca.load_state("x") == {}
+        _session_file(proc.pid, sid, repo)
+        with pytest.raises(SystemExit, match="main checkout"):
+            ca.cmd_adopt(_cfg(home), _adopt_args(session=sid, name="x", move=True))
+        assert proc.poll() is None  # still running
+        assert ca.list_agents(home / "agents") == []
     finally:
         proc.kill()
         proc.wait()
 
 
-def test_a_failed_move_is_rolled_back_and_the_worktree_relocked(home: Path, monkeypatch) -> None:
-    monkeypatch.setattr(ca, "pane", lambda name: None)
-    repo = home / "repo"
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@t",
-                    "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+def test_adopt_dry_run_changes_nothing(home: Path) -> None:
+    work = home / "work"
+    work.mkdir()
+    sid = str(uuid.uuid4())
+    _conversation(work, sid)
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        _session_file(proc.pid, sid, work)
+        ca.cmd_adopt(_cfg(home), _adopt_args(session=sid, name="x", dry_run=True))
+        assert proc.poll() is None and ca.list_agents(home / "agents") == []
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_a_failed_move_is_rolled_back_and_the_worktree_relocked(home: Path) -> None:
+    repo = _git_repo(home / "repo")
     wt = repo / "wt"
     subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "--lock", str(wt)], check=True)
-    _conversation(wt, "s1")
+    sid = str(uuid.uuid4())
+    _conversation(wt, sid)
     root = home / "agents"
-    root.mkdir(exist_ok=True)
     root.chmod(0o555)  # passes the checks; git's move into it then fails
     try:
         with pytest.raises(SystemExit, match="Nothing was adopted"):
-            ca.cmd_adopt(ca.Config(root=root), _adopt_args("sre", dir=str(wt), move=True))
+            ca.cmd_adopt(_cfg(home), _adopt_args(dir=str(wt), name="sre", move=True))
     finally:
         root.chmod(0o755)
-    assert ca.load_state("sre") == {}
-    assert wt.is_dir() and ca.has_transcript(wt, "s1")  # left where it was
-    assert not (ca.project_dir((root / "sre").resolve()) / "s1.jsonl").exists()
-    assert ca._is_locked(str(repo), wt)  # locked again, as the server left it
-
-
-def test_adopt_dry_run_changes_nothing(home: Path, monkeypatch) -> None:
-    monkeypatch.setattr(ca, "pane", lambda name: None)
-    work = home / "work"
-    work.mkdir()
-    _conversation(work, "s1")
-    proc = subprocess.Popen(["sleep", "30"])
-    try:
-        _session_file(proc.pid, "s1", work)
-        ca.cmd_adopt(ca.Config(root=home / "agents"), _adopt_args("x", session="s1", dry_run=True))
-        assert proc.poll() is None and ca.load_state("x") == {}
-        assert not (home / "agents" / "x").exists()
-    finally:
-        proc.kill()
-        proc.wait()
+    assert ca.list_agents(root) == []
+    assert wt.is_dir() and ca.has_transcript(wt, sid)
+    assert ca._is_locked(str(repo), wt)

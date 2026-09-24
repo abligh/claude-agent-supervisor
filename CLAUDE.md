@@ -6,8 +6,8 @@ Code agent running per directory under `AGENTS_ROOT`, each an interactive
 the same conversation on every start. See README.md.
 
 ```
-claude-agents                  the program (run, list, attach, new, fork, adopt, stop,
-                               start, restart, retire, revive)
+claude-agents                  the program (run, list, attach, new, fork, rename, adopt,
+                               stop, start, restart, retire, revive)
 claude-agents.service          systemd unit (runs `claude-agents run`)
 config.example.env             host-wide settings; AGENTS_* are ours, the rest
                                goes into each agent's environment
@@ -30,3 +30,8 @@ Facts it depends on (Claude Code 2.1.281; re-check on upgrades):
   `--remote-control` accepts it. Unapproved channels need a confirmation on
   every start, so unattended agents need `allowedChannelPlugins`.
 - Ctrl-C twice is Claude Code's clean exit.
+- `--session-id <uuid>` names a new session, and combined with
+  `--resume <parent> --fork-session` names the fork: agents' IDs are known
+  before they first run, which is why the layout can be keyed by them.
+- The session file's `name` follows `/rename` and renames made in the app;
+  the supervisor copies it into the agent's JSON.

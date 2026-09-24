@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""claude-agents — run every directory under AGENTS_ROOT as a long-lived Claude Code agent.
+"""claude-agents — keep long-lived Claude Code agents running, one per session.
 
 Each agent is an interactive ``claude --remote-control NAME`` session (so
 claude.ai and the Claude app can reach it), in its own window of one tmux
@@ -7,33 +7,34 @@ server, resumed into the same conversation whenever it starts or restarts,
 and optionally listening on channels (``--channels``) — which the
 ``claude remote-control`` server cannot give its sessions.
 
-Nothing names an agent but its directory:
+An agent is two entries in AGENTS_ROOT, both named by its Claude Code
+session ID, which never changes:
 
-* An agent is a directory in AGENTS_ROOT, or a symlink there to a directory
-  anywhere (a repository worktree, say). Its name is the entry's name. Make
-  one to add an agent; remove it to retire the agent.
-* Its conversation is found, not configured: the one this supervisor last ran
-  there, else the newest Claude Code keeps for that directory.
-* ``claude-agents fork PARENT CHILD`` makes a new agent that starts from a copy
-  of PARENT's conversation. ``--fork-session`` gives it a session of its own,
-  so it gets its own claude.ai session (and, say, its own XMPP address).
+    <session-id>.json       its name (kept in step with the session's own
+                            name, so a rename anywhere shows up here) and
+                            what the supervisor notes: stopped, a fork to
+                            start, where it was adopted from
+    <session-id>.worktree   where it works: a directory, a git worktree, or a
+                            symlink to one anywhere
 
-The only record this program keeps is its own, in ~/.local/state/claude-agents/:
-which session it last ran for each agent, a fork still to be started,
-whether an agent is stopped, and whether it has been given its name yet.
+Its conversation is the session itself: resumed by ID when it exists,
+otherwise started with that ID (``--session-id``). A fork gets a new ID and
+starts from a copy of its parent's conversation (``--fork-session``), so it
+has its own claude.ai session (and, say, its own XMPP address).
 
-Commands::
+Commands take an agent's name, its session ID, or an unambiguous ID prefix::
 
     claude-agents run                       the supervisor (systemd runs this)
     claude-agents list                      agents, their state and claude.ai links
-    claude-agents attach NAME               the agent's terminal (tmux; detach: C-b d)
-    claude-agents new NAME [--dir PATH]     add an agent (PATH: symlink to it)
-    claude-agents fork PARENT CHILD [--dir PATH]
-    claude-agents restart NAME              stop it cleanly; the supervisor resumes it
-    claude-agents stop NAME / start NAME    pause an agent / let it run again
-    claude-agents retire NAME               stop it and move it to AGENTS_ROOT/.retired
-    claude-agents revive NAME               move it back; it resumes its conversation
-    claude-agents adopt NAME (--session ID | --dir PATH) [--move]
+    claude-agents attach AGENT              its terminal (tmux; detach: C-b d)
+    claude-agents new NAME [--dir PATH | --repo PATH]
+    claude-agents fork AGENT NAME [--dir PATH]
+    claude-agents rename AGENT NAME
+    claude-agents restart AGENT             stop it cleanly; the supervisor resumes it
+    claude-agents stop AGENT / start AGENT  pause an agent / let it run again
+    claude-agents retire AGENT              stop it and move it to AGENTS_ROOT/.retired
+    claude-agents revive AGENT              move it back; it resumes its conversation
+    claude-agents adopt (--session ID | --dir PATH) [--name NAME] [--move]
                                             take over a session running elsewhere
 
 Settings: ~/.config/claude-agents/config.env (see config.example.env).
@@ -51,11 +52,13 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-SOCKET = "claude-agents"
-NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+SOCKET = os.environ.get("CLAUDE_AGENTS_SOCKET", "claude-agents")  # separate test setups
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
+SID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 LINK_RE = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9]+")
 QUICK_EXIT_S = 60  # an agent that dies sooner than this counts as failing to start
 
@@ -124,25 +127,63 @@ def load_config(path: Path | None = None) -> Config:
     )
 
 
-# --- agents and their conversations ------------------------------------------------
+
+# --- agents -----------------------------------------------------------------------
 
 
 @dataclass
 class Agent:
-    name: str
-    entry: Path   # the entry in AGENTS_ROOT
-    real: Path    # the directory Claude Code runs in (symlinks resolved)
+    sid: str
+    root: Path
+    meta: dict
+
+    @property
+    def name(self) -> str:
+        return self.meta.get("name") or self.sid[:8]
+
+    @property
+    def json_path(self) -> Path:
+        return self.root / f"{self.sid}.json"
+
+    @property
+    def worktree(self) -> Path:
+        return self.root / f"{self.sid}.worktree"
+
+    @property
+    def real(self) -> Path:
+        """The directory Claude Code runs in (symlinks resolved)."""
+        return self.worktree.resolve()
+
+    def save(self) -> None:
+        tmp = self.root / f".{self.sid}.json.tmp"
+        tmp.write_text(json.dumps(self.meta, indent=2) + "\n")
+        tmp.replace(self.json_path)
+
+    def update(self, **changes) -> None:
+        """Re-read, change, write: the JSON may have been edited meanwhile."""
+        self.meta = {**read_json(self.json_path), **changes}
+        self.meta = {k: v for k, v in self.meta.items() if v is not None}
+        self.save()
+
+
+def read_json(path: Path) -> dict:
+    try:
+        d = json.loads(path.read_text())
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 def list_agents(root: Path) -> list[Agent]:
+    """Every <sid>.json in ``root`` whose <sid>.worktree is a directory."""
     agents = []
     if not root.is_dir():
         return agents
-    for entry in sorted(root.iterdir()):
-        if entry.name.startswith(".") or not NAME_RE.match(entry.name) or not entry.is_dir():
-            continue
-        agents.append(Agent(entry.name, entry, entry.resolve()))
-    return agents
+    for j in sorted(root.glob("*.json")):
+        sid = j.stem
+        if SID_RE.match(sid) and (root / f"{sid}.worktree").is_dir():
+            agents.append(Agent(sid, root, read_json(j)))
+    return sorted(agents, key=lambda a: a.name.lower())
 
 
 def slug(path: Path | str) -> str:
@@ -163,54 +204,108 @@ def newest_session(real: Path) -> str | None:
     return files[-1].stem if files else None
 
 
-def load_state(name: str) -> dict:
-    try:
-        return json.loads((state_dir() / "agents" / f"{name}.json").read_text())
-    except (OSError, ValueError):
-        return {}
-
-
-def save_state(name: str, state: dict) -> None:
-    d = state_dir() / "agents"
-    d.mkdir(parents=True, exist_ok=True)
-    tmp = d / f".{name}.json.tmp"
-    tmp.write_text(json.dumps(state, indent=2) + "\n")
-    tmp.replace(d / f"{name}.json")
-
-
-def session_to_resume(agent: Agent, state: dict) -> str | None:
-    """The conversation to resume: ours if it still exists, else the newest there."""
-    if has_transcript(agent.real, state.get("session")):
-        return state["session"]
-    return newest_session(agent.real)
-
-
-def claude_args(agent: Agent, cfg: Config, state: dict) -> list[str]:
-    args = [cfg.claude, "--remote-control", agent.name]
-    if not state.get("named"):
-        # The agent's name, once: after that the session keeps whatever it is
-        # called, so a rename (in the app, or /rename) survives restarts.
-        args += ["--name", agent.name]
+def claude_args(agent: Agent, cfg: Config) -> list[str]:
+    name = agent.name
+    # --name every time: the JSON follows the live session's name, so this
+    # never undoes a rename — and it applies one made while the agent was down.
+    args = [cfg.claude, "--remote-control", name, "--name", name]
     if cfg.channels:
         args += ["--channels", *cfg.channels]
     if cfg.plugins:
         # Enabled for agents only, not for every Claude session on the machine.
         args += ["--settings", json.dumps({"enabledPlugins": {p: True for p in cfg.plugins}})]
-    if state.get("fork_from"):
-        args += ["--resume", state["fork_from"], "--fork-session"]
+    if has_transcript(agent.real, agent.sid):
+        args += ["--resume", agent.sid]
+    elif agent.meta.get("fork_from"):
+        args += ["--resume", agent.meta["fork_from"], "--fork-session", "--session-id", agent.sid]
     else:
-        session = session_to_resume(agent, state)
-        if session:
-            args += ["--resume", session]
+        args += ["--session-id", agent.sid]
     return args + cfg.extra_args
 
 
-def live_session(pid: int) -> str | None:
-    """The session ID Claude Code (running as ``pid``) has registered, if any."""
-    try:
-        return json.loads((claude_home() / "sessions" / f"{pid}.json").read_text())["sessionId"]
-    except (OSError, ValueError, KeyError):
-        return None
+def live_session(pid: int) -> dict:
+    """What Claude Code (running as ``pid``) says about its session."""
+    return read_json(claude_home() / "sessions" / f"{pid}.json")
+
+
+def resolve(cfg: Config, key: str, agents: list[Agent] | None = None) -> Agent:
+    """An agent by session ID, ID prefix (4+ characters) or current name."""
+    agents = list_agents(cfg.root) if agents is None else agents
+    exact = [a for a in agents if a.sid == key]
+    by_prefix = [a for a in agents if len(key) >= 4 and a.sid.startswith(key.lower())]
+    by_name = [a for a in agents if a.name.casefold() == key.casefold()]
+    for found in (exact, by_name, by_prefix):
+        if len(found) == 1:
+            return found[0]
+        if len(found) > 1:
+            sys.exit(f"claude-agents: {key!r} is ambiguous: "
+                     + ", ".join(f"{a.name} ({a.sid})" for a in found))
+    sys.exit(f"claude-agents: no agent {key!r} in {cfg.root} (see `claude-agents list`)")
+
+
+def create(cfg: Config, name: str, *, dir: str | None = None, repo: str | None = None,
+           sid: str | None = None, **meta) -> Agent:
+    """Make a new agent's two entries (its conversation starts on first run)."""
+    if not NAME_RE.match(name):
+        sys.exit(f"claude-agents: {name!r} is not a usable name")
+    if any(a.name.casefold() == name.casefold() for a in list_agents(cfg.root)):
+        sys.exit(f"claude-agents: there is already an agent called {name!r}")
+    cfg.root.mkdir(parents=True, exist_ok=True)
+    agent = Agent(sid or str(uuid.uuid4()), cfg.root, {"name": name, **meta})
+    wt = agent.worktree
+    if dir:
+        real = Path(dir).expanduser().resolve()
+        if not real.is_dir():
+            sys.exit(f"claude-agents: {real} is not a directory")
+        wt.symlink_to(real)
+    elif repo:
+        branch = re.sub(r"[^A-Za-z0-9._-]", "-", name)
+        r = subprocess.run(["git", "-C", str(Path(repo).expanduser()), "worktree", "add",
+                            "-b", branch, str(wt)], capture_output=True, text=True)
+        if r.returncode != 0:
+            sys.exit(f"claude-agents: git worktree add failed: {r.stderr.strip()}")
+    else:
+        wt.mkdir()
+    # The JSON last: it is what makes the pair an agent.
+    agent.save()
+    return agent
+
+
+# --- converting the old layout (a directory named after the agent) ------------------
+
+
+def legacy_entries(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    return [e for e in sorted(root.iterdir())
+            if not e.name.startswith(".") and e.suffix not in (".json", ".worktree")
+            and not e.name.endswith(".json.tmp") and e.is_dir()]
+
+
+def convert_legacy(cfg: Config, entry: Path) -> None:
+    """``root/NAME`` (the old layout) -> ``root/<sid>.json`` + ``root/<sid>.worktree``."""
+    name = entry.name
+    real = entry.resolve()
+    old_state = read_json(state_dir() / "agents" / f"{name}.json")
+    sid = old_state.get("session") if has_transcript(real, old_state.get("session")) else None
+    sid = sid or newest_session(real)
+    if not sid:
+        sid = str(uuid.uuid4())  # never ran: it simply starts afresh under its new ID
+    stop(name)  # the old layout's tmux session was named after the agent
+    wt = cfg.root / f"{sid}.worktree"
+    if entry.is_symlink():
+        entry.rename(wt)  # the target, and so the conversation's folder, stay put
+    else:
+        if has_transcript(real, sid):
+            _copy_conversation(sid, real, wt)  # filed under the new path first
+        _relocate(entry, wt)
+    meta = {"name": name}
+    for k in ("adopted_from", "stopped"):
+        if old_state.get(k):
+            meta[k] = old_state[k]
+    Agent(sid, cfg.root, meta).save()
+    (state_dir() / "agents" / f"{name}.json").unlink(missing_ok=True)
+    log(f"{name}: converted to {sid}.json + {sid}.worktree")
 
 
 # --- tmux ---------------------------------------------------------------------------
@@ -253,20 +348,6 @@ def tmux_sessions() -> set[str]:
     return set(r.stdout.split()) if r.returncode == 0 else set()
 
 
-def start(agent: Agent, cfg: Config, state: dict) -> None:
-    env = [x for k, v in cfg.session_env.items() for x in ("-e", f"{k}={v}")]
-    args = claude_args(agent, cfg, state)
-    if pane(agent.name) is not None:
-        r = tmux("respawn-pane", "-k", "-t", f"={agent.name}:", "-c", str(agent.real), *env, *args)
-    else:
-        r = tmux("new-session", "-d", "-s", agent.name, "-x", "220", "-y", "50",
-                 "-c", str(agent.real), *env, *args)
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or f"tmux exited {r.returncode}")
-    how = ("forking " + state["fork_from"]) if state.get("fork_from") else (
-        ("resuming " + args[args.index("--resume") + 1]) if "--resume" in args else "new conversation")
-    log(f"{agent.name}: started in {agent.real} ({how})")
-
 
 def stop(*names: str, wait: float = 20.0) -> None:
     """Claude Code's own clean exit (Ctrl-C twice) for each, together; then
@@ -283,6 +364,25 @@ def stop(*names: str, wait: float = 20.0) -> None:
         tmux("kill-session", "-t", f"={n}")
 
 
+
+
+def start(agent: Agent, cfg: Config) -> None:
+    """Start (or restart) the agent in its tmux session, named by its session ID."""
+    env = [x for k, v in cfg.session_env.items() for x in ("-e", f"{k}={v}")]
+    args = claude_args(agent, cfg)
+    if pane(agent.sid) is not None:
+        r = tmux("respawn-pane", "-k", "-t", f"={agent.sid}:", "-c", str(agent.real), *env, *args)
+    else:
+        r = tmux("new-session", "-d", "-s", agent.sid, "-x", "220", "-y", "50",
+                 "-c", str(agent.real), *env, *args)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"tmux exited {r.returncode}")
+    how = ("resuming" if "--fork-session" not in args and "--resume" in args
+           else "forking " + agent.meta["fork_from"] if "--fork-session" in args
+           else "new conversation")
+    log(f"{agent.name} ({agent.sid}): started in {agent.real} ({how})")
+
+
 # --- the supervisor -----------------------------------------------------------------
 
 
@@ -295,48 +395,54 @@ class Supervisor:
         self.stopping = False
 
     def tick(self) -> None:
-        agents = {a.name: a for a in list_agents(self.cfg.root)}
+        for entry in legacy_entries(self.cfg.root):
+            try:
+                convert_legacy(self.cfg, entry)
+            except (OSError, RuntimeError, SystemExit) as exc:
+                log(f"{entry.name}: could not convert to the new layout: {exc}")
+        agents = {a.sid: a for a in list_agents(self.cfg.root)}
         gone = tmux_sessions() - set(agents)
         if gone:
-            log(f"{', '.join(sorted(gone))}: directory gone; stopping")
+            log(f"{', '.join(sorted(gone))}: no longer an agent; stopping")
             stop(*gone)
         now = time.monotonic()
-        for name, agent in agents.items():
-            state = load_state(name)
-            p = pane(name)
-            if state.get("stopped"):
+        for sid, agent in agents.items():
+            p = pane(sid)
+            if agent.meta.get("stopped"):
                 if p:
-                    log(f"{name}: stopped by request")
-                    stop(name)
+                    log(f"{agent.name}: stopped by request")
+                    stop(sid)
                 continue
             if p and not p.dead:
-                self._record_session(agent, p, state)
+                self._follow(agent, p)
                 continue
-            if p and p.dead and name in self.started_at:
-                quick = now - self.started_at.pop(name) < QUICK_EXIT_S
-                self.failures[name] = self.failures.get(name, 0) + 1 if quick else 0
-                delay = min(300.0, 10.0 * 2 ** (self.failures[name] - 1)) if quick else 5.0
-                self.not_before[name] = now + delay
-                log(f"{name}: exited ({p.status}); restarting in {delay:.0f}s")
-            if now < self.not_before.get(name, 0):
+            if p and p.dead and sid in self.started_at:
+                quick = now - self.started_at.pop(sid) < QUICK_EXIT_S
+                self.failures[sid] = self.failures.get(sid, 0) + 1 if quick else 0
+                delay = min(300.0, 10.0 * 2 ** (self.failures[sid] - 1)) if quick else 5.0
+                self.not_before[sid] = now + delay
+                log(f"{agent.name}: exited ({p.status}); restarting in {delay:.0f}s")
+            if now < self.not_before.get(sid, 0):
                 continue
             try:
-                start(agent, self.cfg, state)
-                self.started_at[name] = now
-                if not state.get("named"):
-                    save_state(name, {**load_state(name), "named": True})
+                start(agent, self.cfg)
+                self.started_at[sid] = now
             except (RuntimeError, OSError) as exc:
-                log(f"{name}: could not start: {exc}")
-                self.not_before[name] = now + 60
+                log(f"{agent.name}: could not start: {exc}")
+                self.not_before[sid] = now + 60
 
-    def _record_session(self, agent: Agent, p: Pane, state: dict) -> None:
-        """Remember the running conversation, once it exists on disk."""
-        session = live_session(p.pid)
-        if session and session != state.get("session") and has_transcript(agent.real, session):
-            state = {k: v for k, v in state.items() if k != "fork_from"}
-            state["session"] = session
-            save_state(agent.name, state)
-            log(f"{agent.name}: conversation {session}")
+    def _follow(self, agent: Agent, p: Pane) -> None:
+        """Keep the JSON in step with the running session: its name, and once
+        a fork's own conversation exists, forget the parent."""
+        live = live_session(p.pid)
+        if live.get("sessionId") != agent.sid:
+            return
+        name = live.get("name")
+        if name and name != agent.meta.get("name"):
+            log(f"{agent.name}: renamed to {name}")
+            agent.update(name=name)
+        if agent.meta.get("fork_from") and has_transcript(agent.real, agent.sid):
+            agent.update(fork_from=None)
 
     def run(self) -> None:
         write_tmux_conf()
@@ -357,155 +463,8 @@ class Supervisor:
         tmux("kill-server")
 
 
-# --- commands -------------------------------------------------------------------------
 
-
-def _agent(cfg: Config, name: str) -> Agent:
-    for a in list_agents(cfg.root):
-        if a.name == name:
-            return a
-    sys.exit(f"claude-agents: no agent {name!r} in {cfg.root}")
-
-
-def _new_entry(cfg: Config, name: str, target: str | None) -> Path:
-    if not NAME_RE.match(name):
-        sys.exit(f"claude-agents: {name!r} is not a usable name (letters, digits, . _ -)")
-    entry = cfg.root / name
-    if entry.exists() or entry.is_symlink():
-        sys.exit(f"claude-agents: {entry} already exists")
-    cfg.root.mkdir(parents=True, exist_ok=True)
-    if target:
-        real = Path(target).expanduser().resolve()
-        if not real.is_dir():
-            sys.exit(f"claude-agents: {real} is not a directory")
-        entry.symlink_to(real)
-    else:
-        entry.mkdir()
-    return entry
-
-
-def cmd_list(cfg: Config, _args) -> None:
-    agents = list_agents(cfg.root)
-    if not agents:
-        print(f"No agents in {cfg.root}.")
-        return
-    for a in agents:
-        p, state = pane(a.name), load_state(a.name)
-        status = "not running" if p is None else ("exited" if p.dead else "running")
-        if state.get("stopped"):
-            status = "stopped"
-        session = (live_session(p.pid) if p and not p.dead else None) or state.get("session") or "-"
-        link = ""
-        if p:
-            links = LINK_RE.findall(tmux("capture-pane", "-p", "-S", "-5000", "-t", f"={a.name}:").stdout)
-            link = links[-1] if links else ""
-        where = f"{a.entry} -> {a.real}" if a.entry.is_symlink() else str(a.real)
-        print(f"{a.name:20} {status:12} {session:38} {link}\n{'':20} {where}")
-
-
-def cmd_attach(cfg: Config, args) -> None:
-    _agent(cfg, args.name)
-    os.execvp("tmux", ["tmux", "-L", SOCKET, "attach", "-t", f"={args.name}"])
-
-
-def cmd_new(cfg: Config, args) -> None:
-    entry = _new_entry(cfg, args.name, args.dir)
-    print(f"Added {args.name} ({entry.resolve()}); the supervisor starts it within "
-          f"{cfg.poll:.0f}s: `claude-agents list`.")
-
-
-def prepare_fork(cfg: Config, parent: Agent, child_name: str, target: str | None) -> Agent:
-    """Make CHILD's directory and give it a copy of PARENT's conversation to fork."""
-    p = pane(parent.name)
-    session = (live_session(p.pid) if p and not p.dead else None) or session_to_resume(
-        parent, load_state(parent.name))
-    if not has_transcript(parent.real, session):
-        sys.exit(f"claude-agents: {parent.name} has no conversation to fork yet")
-    if target is None and _git_toplevel(parent.real):
-        # A worktree of the parent's repository, on a branch named after the child.
-        entry = cfg.root / child_name
-        if not NAME_RE.match(child_name) or entry.exists() or entry.is_symlink():
-            sys.exit(f"claude-agents: cannot create {entry}")
-        r = subprocess.run(["git", "-C", str(parent.real), "worktree", "add", "-b", child_name,
-                            str(entry)], capture_output=True, text=True)
-        if r.returncode != 0:
-            sys.exit(f"claude-agents: git worktree add failed: {r.stderr.strip()}")
-    else:
-        entry = _new_entry(cfg, child_name, target)
-    child = Agent(child_name, entry, entry.resolve())
-    # --resume looks the conversation up by directory, so it must be filed
-    # under the child's. The copy is a snapshot: the parent carries on.
-    src, dst = project_dir(parent.real), project_dir(child.real)
-    dst.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src / f"{session}.jsonl", dst / f"{session}.jsonl")
-    if (src / session).is_dir():
-        shutil.copytree(src / session, dst / session, dirs_exist_ok=True)
-    save_state(child_name, {"fork_from": session, "forked_from_agent": parent.name})
-    return child
-
-
-def _git_toplevel(path: Path) -> str | None:
-    r = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"],
-                       capture_output=True, text=True)
-    return r.stdout.strip() if r.returncode == 0 else None
-
-
-def cmd_fork(cfg: Config, args) -> None:
-    child = prepare_fork(cfg, _agent(cfg, args.parent), args.child, args.dir)
-    print(f"Forked {args.parent} into {args.child} ({child.real}); the supervisor starts it "
-          f"within {cfg.poll:.0f}s, from a copy of {args.parent}'s conversation.")
-
-
-def cmd_stop(cfg: Config, args) -> None:
-    _agent(cfg, args.name)
-    save_state(args.name, {**load_state(args.name), "stopped": True})
-    stop(args.name)
-    print(f"Stopped {args.name}; it stays stopped until `claude-agents start {args.name}`.")
-
-
-def cmd_start(cfg: Config, args) -> None:
-    _agent(cfg, args.name)
-    save_state(args.name, {k: v for k, v in load_state(args.name).items() if k != "stopped"})
-    print(f"{args.name} will be started within {cfg.poll:.0f}s, resuming its conversation.")
-
-
-def _move(src: Path, dst: Path) -> None:
-    """Move an agent's entry; a git worktree has to be moved by git."""
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    if dst.exists() or dst.is_symlink():
-        sys.exit(f"claude-agents: {dst} already exists")
-    if not src.is_symlink() and (src / ".git").is_file():
-        # Run from the main repository, not from inside the worktree being moved.
-        common = subprocess.run(["git", "-C", str(src), "rev-parse", "--path-format=absolute",
-                                 "--git-common-dir"], capture_output=True, text=True).stdout.strip()
-        r = subprocess.run(["git", "-C", str(Path(common).parent), "worktree", "move", str(src),
-                            str(dst)], capture_output=True, text=True)
-        if r.returncode != 0:
-            sys.exit(f"claude-agents: git worktree move failed: {r.stderr.strip()}")
-    else:
-        src.rename(dst)
-
-
-def cmd_retire(cfg: Config, args) -> None:
-    """Stop the agent and move its entry aside. Nothing is deleted: its files
-    and conversation stay, and ``revive`` brings it back where it was."""
-    agent = _agent(cfg, args.name)
-    save_state(args.name, {**load_state(args.name), "stopped": True})
-    stop(args.name)
-    _move(agent.entry, cfg.root / ".retired" / args.name)
-    save_state(args.name, {k: v for k, v in load_state(args.name).items() if k != "stopped"})
-    print(f"Retired {args.name} to {cfg.root / '.retired' / args.name}.")
-
-
-def cmd_revive(cfg: Config, args) -> None:
-    src = cfg.root / ".retired" / args.name
-    if not (src.exists() or src.is_symlink()):
-        sys.exit(f"claude-agents: no retired agent {args.name!r} in {src.parent}")
-    _move(src, cfg.root / args.name)
-    print(f"Revived {args.name}; it resumes its conversation within {cfg.poll:.0f}s.")
-
-
-# --- adopting a session that runs elsewhere ------------------------------------------
+# --- adopting a session that runs elsewhere, and moving agents ------------------------
 
 
 def _alive(pid: int) -> bool:
@@ -612,7 +571,7 @@ def _stop_process(pid: int, wait: float = 30.0) -> None:
 
 
 def _copy_conversation(session: str, src_dir: Path, dst_dir: Path) -> None:
-    src, dst = project_dir(src_dir), project_dir(dst_dir)
+    src, dst = project_dir(src_dir.resolve()), project_dir(dst_dir.resolve())
     dst.mkdir(parents=True, exist_ok=True)
     shutil.copy2(src / f"{session}.jsonl", dst / f"{session}.jsonl")
     if (src / session).is_dir():
@@ -666,12 +625,132 @@ def _relocate(src: Path, dst: Path) -> None:
         raise RuntimeError(f"git worktree move failed: {r.stderr.strip()}")
 
 
-def cmd_adopt(cfg: Config, args) -> None:
+
+# --- commands -------------------------------------------------------------------------
+
+
+def cmd_list(cfg: Config, _args) -> None:
+    agents = list_agents(cfg.root)
+    if not agents:
+        print(f"No agents in {cfg.root}.")
+        return
+    for a in agents:
+        p = pane(a.sid)
+        status = "not running" if p is None else ("exited" if p.dead else "running")
+        if a.meta.get("stopped"):
+            status = "stopped"
+        link = ""
+        if p:
+            links = LINK_RE.findall(tmux("capture-pane", "-p", "-S", "-5000",
+                                         "-t", f"={a.sid}:").stdout)
+            link = links[-1] if links else ""
+        where = f"{a.worktree} -> {a.real}" if a.worktree.is_symlink() else str(a.real)
+        print(f"{a.name:20} {status:12} {a.sid}  {link}\n{'':20} {where}")
+
+
+def cmd_attach(cfg: Config, args) -> None:
+    a = resolve(cfg, args.agent)
+    os.execvp("tmux", ["tmux", "-L", SOCKET, "attach", "-t", f"={a.sid}"])
+
+
+def cmd_new(cfg: Config, args) -> None:
+    a = create(cfg, args.name, dir=args.dir, repo=args.repo)
+    print(f"Added {a.name} ({a.sid}); the supervisor starts it within {cfg.poll:.0f}s.")
+
+
+def _git_toplevel(path: Path) -> str | None:
+    r = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                       capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def cmd_fork(cfg: Config, args) -> None:
+    """A new agent that starts from a copy of PARENT's conversation."""
+    parent = resolve(cfg, args.agent)
+    if not has_transcript(parent.real, parent.sid):
+        sys.exit(f"claude-agents: {parent.name} has no conversation to fork yet")
+    repo = _git_toplevel(parent.real) if args.dir is None else None
+    child = create(cfg, args.name, dir=args.dir, repo=repo, sid=str(uuid.uuid4()),
+                   fork_from=parent.sid, forked_from=parent.name)
+    # --resume finds conversations by directory: file a copy (a snapshot; the
+    # parent carries on) under the child's.
+    _copy_conversation(parent.sid, parent.real, child.real)
+    print(f"Forked {parent.name} into {child.name} ({child.sid}); the supervisor starts it "
+          f"within {cfg.poll:.0f}s, from a copy of {parent.name}'s conversation.")
+
+
+def cmd_rename(cfg: Config, args) -> None:
+    a = resolve(cfg, args.agent)
     if not NAME_RE.match(args.name):
-        sys.exit(f"claude-agents: {args.name!r} is not a usable name (letters, digits, . _ -)")
-    entry = cfg.root / args.name
-    if entry.exists() or entry.is_symlink():
-        sys.exit(f"claude-agents: {entry} already exists")
+        sys.exit(f"claude-agents: {args.name!r} is not a usable name")
+    p = pane(a.sid)
+    if p and not p.dead:
+        # The session's own rename: every place that shows its name follows,
+        # and the supervisor picks it up from the session within a poll.
+        tmux("send-keys", "-t", f"={a.sid}:", "-l", f"/rename {args.name}")
+        tmux("send-keys", "-t", f"={a.sid}:", "Enter")
+        print(f"Renaming {a.name} to {args.name} in its session.")
+    else:
+        a.update(name=args.name)
+        print(f"Renamed {a.name} to {args.name}; its session takes the name when it next starts.")
+
+
+def cmd_stop(cfg: Config, args) -> None:
+    a = resolve(cfg, args.agent)
+    a.update(stopped=True)
+    stop(a.sid)
+    print(f"Stopped {a.name}; it stays stopped until `claude-agents start {a.name}`.")
+
+
+def cmd_start(cfg: Config, args) -> None:
+    a = resolve(cfg, args.agent)
+    a.update(stopped=None)
+    print(f"{a.name} will be started within {cfg.poll:.0f}s, resuming its conversation.")
+
+
+def cmd_restart(cfg: Config, args) -> None:
+    a = resolve(cfg, args.agent)
+    stop(a.sid)
+    print(f"Stopped {a.name}; the supervisor resumes it within {cfg.poll:.0f}s.")
+
+
+def cmd_retire(cfg: Config, args) -> None:
+    """Stop the agent and move its entries aside. Nothing is deleted: its files
+    and conversation stay, and ``revive`` brings it back where it was."""
+    a = resolve(cfg, args.agent)
+    retired = cfg.root / ".retired"
+    retired.mkdir(exist_ok=True)
+    a.update(stopped=True)
+    stop(a.sid)
+    wt = a.worktree
+    if wt.is_symlink():
+        wt.rename(retired / wt.name)
+    else:
+        if has_transcript(a.real, a.sid):
+            _copy_conversation(a.sid, a.real, retired / wt.name)
+        _relocate(wt, retired / wt.name)
+    a.json_path.rename(retired / a.json_path.name)
+    print(f"Retired {a.name} to {retired}.")
+
+
+def cmd_revive(cfg: Config, args) -> None:
+    retired = cfg.root / ".retired"
+    candidates = [Agent(j.stem, retired, read_json(j)) for j in retired.glob("*.json")
+                  if SID_RE.match(j.stem)] if retired.is_dir() else []
+    a = resolve(cfg, args.agent, candidates)
+    wt = a.worktree
+    if wt.is_symlink():
+        wt.rename(cfg.root / wt.name)
+    else:
+        if has_transcript(a.real, a.sid):
+            _copy_conversation(a.sid, a.real, cfg.root / wt.name)
+        _relocate(wt, cfg.root / wt.name)
+    a.json_path.rename(cfg.root / a.json_path.name)
+    Agent(a.sid, cfg.root, read_json(cfg.root / a.json_path.name)).update(stopped=None)
+    print(f"Revived {a.name}; it resumes its conversation within {cfg.poll:.0f}s.")
+
+
+def cmd_adopt(cfg: Config, args) -> None:
     if args.session:
         session = args.session
         pids, cwd = find_session(session)
@@ -685,14 +764,25 @@ def cmd_adopt(cfg: Config, args) -> None:
             sys.exit(f"claude-agents: no conversation found in {real}")
     if not has_transcript(real, session):
         sys.exit(f"claude-agents: session {session} has no conversation under {real}")
+    if any(a.sid == session for a in list_agents(cfg.root)):
+        sys.exit(f"claude-agents: session {session} is already an agent here")
     root = cfg.root.resolve()
     if real == root or root in real.parents:
         sys.exit(f"claude-agents: {real} is already under {cfg.root}")
+    name = args.name
+    if not name:
+        live = [live_session(p) for p in pids]
+        name = next((s.get("name") for s in live if s.get("name")), None) or real.name
+    if not NAME_RE.match(name):
+        sys.exit(f"claude-agents: {name!r} is not a usable name; pass --name")
+    if any(a.name.casefold() == name.casefold() for a in list_agents(cfg.root)):
+        sys.exit(f"claude-agents: there is already an agent called {name!r}; pass --name")
     if args.move and (problem := _move_problem(real, cfg.root)):
         sys.exit(f"claude-agents: {problem}")
-    target = entry if args.move else real
-    print(f"Adopting session {session} from {real} as {args.name}"
-          + (f", moving it to {entry}" if args.move else f" ({entry} -> {real})")
+    agent = Agent(session, cfg.root, {"name": name, "adopted_from": str(real)})
+    print(f"Adopting session {session} from {real} as {name}"
+          + (f", moving it to {agent.worktree}" if args.move
+             else f" ({agent.worktree} -> {real})")
           + (f"; stopping process {', '.join(map(str, pids))}" if pids else "") + ".")
 
     adopting_self = bool(set(pids) & _ancestors())
@@ -703,7 +793,7 @@ def cmd_adopt(cfg: Config, args) -> None:
         return
     if adopting_self:
         # We are running inside the session we adopt: stopping it would stop us.
-        log_path = state_dir() / f"adopt-{args.name}.log"
+        log_path = state_dir() / f"adopt-{session}.log"
         print(f"This is the session being adopted: carrying on in the background in "
               f"{args.grace:.0f}s, once this reply has finished. Log: {log_path}", flush=True)
         _detach(log_path)
@@ -713,41 +803,34 @@ def cmd_adopt(cfg: Config, args) -> None:
     if any(_alive(p) for p in pids):
         sys.exit("claude-agents: the session is still running; not adopting it")
 
-    # The conversation and the pinned session are in place before the entry
-    # appears, so the supervisor never starts the agent without them.
-    if args.move:
-        _copy_conversation(session, real, target)
-    save_state(args.name, {"session": session, "adopted_from": str(real)})
+    # The conversation is in place before the entries appear, and the JSON
+    # comes last, so the supervisor never starts the agent without it.
     try:
         if args.move:
-            _relocate(real, entry)
+            _copy_conversation(session, real, agent.worktree)
+            _relocate(real, agent.worktree)
         else:
-            entry.symlink_to(real)
+            agent.worktree.symlink_to(real)
+        agent.save()
     except (OSError, RuntimeError) as exc:
-        # Undo what was prepared; the session stays where it was, stopped.
-        (state_dir() / "agents" / f"{args.name}.json").unlink(missing_ok=True)
         if args.move:
-            copied = project_dir(target)
+            copied = project_dir(agent.worktree)
             (copied / f"{session}.jsonl").unlink(missing_ok=True)
             shutil.rmtree(copied / session, ignore_errors=True)
-        sys.exit(f"claude-agents: could not create {entry}: {exc}. Nothing was adopted; "
+        if agent.worktree.is_symlink():
+            agent.worktree.unlink()
+        sys.exit(f"claude-agents: could not adopt it: {exc}. Nothing was adopted; "
                  f"the session is stopped and can be resumed where it was.")
-    log(f"adopted {session} as {args.name}")
+    log(f"adopted {session} as {name}")
     deadline = time.monotonic() + args.wait
     while time.monotonic() < deadline:
-        p = pane(args.name)
-        if p and not p.dead and live_session(p.pid) == session:
-            log(f"{args.name} is running under the supervisor, resuming {session}")
+        p = pane(session)
+        if p and not p.dead and live_session(p.pid).get("sessionId") == session:
+            log(f"{name} is running under the supervisor, resuming {session}")
             return
         time.sleep(2)
     if args.wait:
-        log(f"{args.name}: not seen running yet; check `claude-agents list` and the supervisor's log")
-
-
-def cmd_restart(cfg: Config, args) -> None:
-    _agent(cfg, args.name)
-    stop(args.name)
-    print(f"Stopped {args.name}; the supervisor resumes it within {cfg.poll:.0f}s.")
+        log(f"{name}: not seen running yet; check `claude-agents list` and the supervisor's log")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -756,32 +839,37 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("run")
     sub.add_parser("list")
     for name in ("attach", "restart", "stop", "start", "retire", "revive"):
-        sub.add_parser(name).add_argument("name")
+        sub.add_parser(name).add_argument("agent")
     p = sub.add_parser("new")
     p.add_argument("name")
-    p.add_argument("--dir")
-    p = sub.add_parser("adopt")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--dir", help="work in this directory (a symlink to it)")
+    g.add_argument("--repo", help="work in a new git worktree of this repository")
+    p = sub.add_parser("fork")
+    p.add_argument("agent")
     p.add_argument("name")
+    p.add_argument("--dir")
+    p = sub.add_parser("rename")
+    p.add_argument("agent")
+    p.add_argument("name")
+    p = sub.add_parser("adopt")
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--session")
     g.add_argument("--dir")
+    p.add_argument("--name", help="default: the session's own name")
     p.add_argument("--move", action="store_true")
+    p.add_argument("--dry-run", action="store_true", help="check and show the plan; change nothing")
     p.add_argument("--grace", type=float, default=10.0,
                    help="seconds to wait before stopping, when adopting the session running us")
-    p.add_argument("--dry-run", action="store_true", help="check and show the plan; change nothing")
     p.add_argument("--wait", type=float, default=60.0,
                    help="seconds to wait for the supervisor to start it (0: don't)")
-    p = sub.add_parser("fork")
-    p.add_argument("parent")
-    p.add_argument("child")
-    p.add_argument("--dir")
     args = ap.parse_args(argv)
     cfg = load_config()
     if args.cmd == "run":
         Supervisor(cfg).run()
     else:
         {"list": cmd_list, "attach": cmd_attach, "new": cmd_new, "fork": cmd_fork,
-         "restart": cmd_restart, "stop": cmd_stop, "start": cmd_start,
+         "rename": cmd_rename, "restart": cmd_restart, "stop": cmd_stop, "start": cmd_start,
          "retire": cmd_retire, "revive": cmd_revive, "adopt": cmd_adopt}[args.cmd](cfg, args)
 
 

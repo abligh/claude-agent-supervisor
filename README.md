@@ -27,60 +27,83 @@ If you don't need channels, the Remote Control server may be all you need.
 This adds channels, plus local terminal access and forks, while keeping its
 property that nothing has to be recorded per agent.
 
-## Nothing to record per agent
+## One agent, one session
 
-* **An agent is a directory** at the top of `AGENTS_ROOT`, or a symlink there
-  to a directory anywhere (a git worktree, say). Its name is the entry's name.
-  Create one and the supervisor starts it within seconds.
-* **Its conversation is found, not configured**: the one the supervisor last
-  ran there, or else the newest Claude Code keeps for that directory. Claude
-  Code files conversations by directory; that is what `--resume` searches. An
-  empty directory starts a new conversation.
-* **It is named once.** The first start passes `--name NAME`; after that the
-  session keeps its name, so renaming it (in the app, or `/rename`) sticks.
+An agent is two entries in `AGENTS_ROOT`, named by its Claude Code session
+ID, which never changes:
+
+```
+~/agents/3f2a91c0-….json       its name, and what the supervisor notes about it
+~/agents/3f2a91c0-….worktree   where it works: a directory, a git worktree,
+                               or a symlink to one anywhere
+```
+
+* **The session ID is the key.** The conversation is that session: resumed by
+  ID when it exists, otherwise started with that ID (`--session-id`), so the
+  supervisor never has to guess which conversation belongs to which agent,
+  and a directory never needs renaming.
+* **The name lives in the JSON and follows the session.** Rename an agent
+  anywhere (in the app, with `/rename`, or with `claude-agents rename`) and
+  the supervisor copies the session's new name into the JSON within a poll.
+  Every command takes the current name, the session ID, or an unambiguous
+  prefix of it.
 * **It appears in the app by itself.** Each session registers with claude.ai
-  as it starts, and after a restart it rejoins the same claude.ai session.
-* The supervisor's only state is its own, in `~/.local/state/claude-agents/`:
-  each agent's last conversation, a fork waiting to start, and whether it is
-  stopped.
+  as it starts, under its name, and after a restart it rejoins the same
+  claude.ai session.
+* The JSON also records whether the agent is stopped, a fork waiting to
+  start, and where an adopted agent came from.
 
 **Only `AGENTS_ROOT` counts.** The supervisor never looks at git: a
-repository can have any number of worktrees anywhere, and none of them is an
-agent unless it has an entry in `AGENTS_ROOT`. So keep that directory for
-agents only (never `~`). Anything a tool creates there comes to life as an
-agent. Hidden entries (`.name`) are ignored.
+repository can have any number of worktrees anywhere, and none is an agent
+unless it has a pair in `AGENTS_ROOT`. Keep that directory for agents only.
+Hidden entries (`.retired/`, …) are ignored.
+
+**Converting the old layout.** Earlier versions used a directory named after
+the agent (`~/agents/claude-dev`). The supervisor converts one of those by
+itself: it stops the agent cleanly, moves its directory to
+`<session-id>.worktree` (a git worktree by git), files its conversation
+under the new path, writes the JSON, and resumes it.
 
 ## Commands
 
 ```
-claude-agents list                        agents, state, session IDs, claude.ai links
-claude-agents attach NAME                 its terminal (tmux; detach with C-b d)
+claude-agents list                          agents, state, session IDs, claude.ai links
+claude-agents attach AGENT                  its terminal (tmux; detach with C-b d)
 
-claude-agents new NAME [--dir PATH]       add an agent (a directory, or a symlink to PATH)
-claude-agents fork PARENT CHILD [--dir PATH]
-claude-agents stop NAME                   pause it; it stays stopped
-claude-agents start NAME                  let it run again (resuming its conversation)
-claude-agents restart NAME                clean stop; the supervisor resumes it at once
-claude-agents retire NAME                 stop it and move it to AGENTS_ROOT/.retired
-claude-agents revive NAME                 move it back; it resumes where it left off
-claude-agents adopt NAME (--session ID | --dir PATH) [--move] [--dry-run]
-                                          take over a session running elsewhere
+claude-agents new NAME [--dir PATH | --repo PATH]
+                                            a new agent: in a new directory, a symlink
+                                            to PATH, or a new git worktree of PATH
+claude-agents fork AGENT NAME [--dir PATH]  a new agent from a copy of AGENT's conversation
+claude-agents rename AGENT NAME
+claude-agents stop AGENT                    pause it; it stays stopped
+claude-agents start AGENT                   let it run again (resuming its conversation)
+claude-agents restart AGENT                 clean stop; the supervisor resumes it at once
+claude-agents retire AGENT                  stop it and move it to AGENTS_ROOT/.retired
+claude-agents revive AGENT                  move it back; it resumes where it left off
+claude-agents adopt (--session ID | --dir PATH) [--name NAME] [--move] [--dry-run]
+                                            take over a session running elsewhere
 ```
 
-`mkdir`, `git worktree add` and `ln -s` in `AGENTS_ROOT` work as well as
-`new`. **Don't rename or move an agent's directory by hand.** Its
-conversation is filed under the directory's path, so a moved agent starts
-afresh. `retire`/`revive` move it and put it back at the same path. Nothing is
-ever deleted: a retired agent keeps its files and its conversation.
+`AGENT` is a name, a session ID or an ID prefix. **Don't move an agent's
+worktree by hand.** Its conversation is filed under the worktree's path, so a
+moved agent would start afresh. `retire`/`revive` move it with its
+conversation. Nothing is ever deleted: a retired agent keeps its files and
+its conversation.
 
-**Forking.** `fork PARENT CHILD` makes CHILD's directory: a new git worktree
-of the parent's repository on a branch named CHILD if the parent is in one,
+**Renaming.** `rename` types `/rename NAME` into a running agent's session,
+so the session renames itself and the supervisor follows. For a stopped
+agent it changes the JSON, and the session takes the name when it next
+starts.
+
+**Forking.** `fork AGENT NAME` makes the child's worktree: a new git worktree
+of the parent's repository on a branch named NAME if the parent is in one,
 else a plain directory, or `--dir`. It files a copy of the parent's
-conversation under the child's directory (`--resume` searches by directory),
-and the child starts with `--resume <parent> --fork-session`. The child has
-the parent's history but a session of its own: its own claude.ai session, and
-its own identity on any channel that derives one from the session. The
-parent carries on untouched. An agent can fork itself by running the command.
+conversation under the child's worktree (`--resume` searches by directory),
+and the child starts with `--resume <parent> --fork-session --session-id
+<its own>`. The child has the parent's history but a session of its own: its
+own claude.ai session, and its own identity on any channel that derives one
+from the session. The parent carries on untouched. An agent can fork itself
+by running the command.
 
 **What can't be done**: creating an agent from the Claude app's "new
 session". That belongs to the Remote Control server. Create agents by
@@ -118,9 +141,9 @@ command, or ask an agent to.
 server's sessions included, with its conversation:
 
 ```
-claude-agents adopt reviewer --session 3f2a…          # or --dir <its directory>
-claude-agents adopt reviewer --session 3f2a… --move   # relocate it into AGENTS_ROOT
-claude-agents adopt reviewer --session 3f2a… --dry-run
+claude-agents adopt --session 3f2a…            # or --dir <its directory>
+claude-agents adopt --session 3f2a… --move     # relocate it into AGENTS_ROOT
+claude-agents adopt --session 3f2a… --dry-run
 ```
 
 It finds the session's directory, and the process running it, from Claude
@@ -130,10 +153,10 @@ session's ID, directory and name). Then it:
 1. checks everything that could go wrong, before touching anything;
 2. stops that process (`SIGTERM`, then `SIGKILL` after 30 s), so the
    conversation never runs in two processes;
-3. pins the session, and with `--move` files a copy of the conversation under
-   the new path;
-4. makes the entry: a symlink to the directory, or with `--move` the
-   directory itself, moved into `AGENTS_ROOT`. A git worktree is moved by
+3. with `--move`, files a copy of the conversation under the new path;
+4. makes the pair: `<session-id>.worktree` as a symlink to the directory, or
+   with `--move` the directory itself, moved into `AGENTS_ROOT`; then the
+   JSON, named after the session's own name unless `--name` says otherwise. A git worktree is moved by
    git, keeping its branch and any uncommitted work, and is unlocked first:
    the Remote Control server locks its worktrees. The supervisor then resumes
    it within seconds.
@@ -147,10 +170,9 @@ where it is. That's right for directories you own, and the only option for a
 repository's main checkout, or across filesystems (`git worktree move`
 cannot cross them; `adopt` says so before stopping anything).
 
-**An agent can adopt itself** (`claude-agents adopt NAME --dir "$PWD"
---move`): `adopt` sees it is running inside the session it stops, detaches,
+**An agent can adopt itself** (`claude-agents adopt --dir "$PWD" --move`): `adopt` sees it is running inside the session it stops, detaches,
 lets the current reply finish (`--grace`, 10 s), and carries on in the
-background, logging to `~/.local/state/claude-agents/adopt-NAME.log`.
+background, logging to `~/.local/state/claude-agents/adopt-<session-id>.log`.
 
 If the last step fails, `adopt` undoes what it prepared. The session is
 left stopped where it was, and resumes there as before.
