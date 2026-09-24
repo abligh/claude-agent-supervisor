@@ -324,15 +324,29 @@ def legacy_entries(root: Path) -> list[Path]:
             and not e.name.endswith(".json.tmp") and e.is_dir()]
 
 
+class NotLegacy(Exception):
+    """An entry that looks like the old layout but must not be converted."""
+
+
 def convert_legacy(cfg: Config, entry: Path) -> None:
-    """``root/NAME`` (the old layout) -> ``root/<sid>.json`` + ``root/<sid>.worktree``."""
+    """``root/NAME`` (the old layout) -> ``root/<sid>.json`` + ``root/<sid>.worktree``.
+
+    Everything is checked before anything is touched: an entry whose session
+    already is an agent here (a leftover, or a directory something else
+    recreated at the old path) is left alone, as is one with no conversation
+    of its own.
+    """
     name = entry.name
     real = entry.resolve()
     old_state = read_json(state_dir() / "agents" / f"{name}.json")
     sid = old_state.get("session") if has_transcript(real, old_state.get("session")) else None
     sid = sid or newest_session(real)
     if not sid:
-        sid = str(uuid.uuid4())  # never ran: it simply starts afresh under its new ID
+        raise NotLegacy("no conversation of its own; not an agent (see `claude-agents new`)")
+    if (cfg.root / f"{sid}.json").exists() or (cfg.root / f"{sid}.worktree").exists():
+        raise NotLegacy(f"its session {sid} is already an agent here; leaving it alone")
+    if entry.stat().st_uid != os.getuid():
+        raise NotLegacy("not owned by this user; not an agent")
     p = pane(name)  # the old layout's tmux session was named after the agent
     live = live_session(p.pid) if p and not p.dead else {}
     stop(name)
@@ -439,14 +453,17 @@ class Supervisor:
         self.started_at: dict[str, float] = {}
         self.not_before: dict[str, float] = {}
         self.failures: dict[str, int] = {}
+        self.reported: set[str] = set()
         self.stopping = False
 
     def tick(self) -> None:
         for entry in legacy_entries(self.cfg.root):
             try:
                 convert_legacy(self.cfg, entry)
-            except (OSError, RuntimeError, SystemExit) as exc:
-                log(f"{entry.name}: could not convert to the new layout: {exc}")
+            except (NotLegacy, OSError, RuntimeError, SystemExit) as exc:
+                if entry.name not in self.reported:  # once, not every tick
+                    self.reported.add(entry.name)
+                    log(f"{entry.name}: not converted: {exc}")
         agents = {a.sid: a for a in list_agents(self.cfg.root)}
         gone = tmux_sessions() - set(agents)
         if gone:
@@ -617,10 +634,25 @@ def _stop_process(pid: int, wait: float = 30.0) -> None:
         time.sleep(1)
 
 
-def _copy_conversation(session: str, src_dir: Path, dst_dir: Path) -> None:
+def _copy_conversation(session: str, src_dir: Path, dst_dir: Path,
+                       replace_older: bool = False) -> None:
+    """File a copy of ``session``'s conversation under ``dst_dir``.
+
+    Never overwrites a conversation that is as new as, or newer than, the one
+    being copied: that could be a live session's, and overwriting it loses
+    everything said since. An older copy there is replaced only with
+    ``replace_older`` (moving an agent's own conversation back and forth);
+    otherwise it is an error.
+    """
     src, dst = project_dir(src_dir.resolve()), project_dir(dst_dir.resolve())
+    s_file, d_file = src / f"{session}.jsonl", dst / f"{session}.jsonl"
+    if d_file.exists():
+        if d_file.stat().st_mtime >= s_file.stat().st_mtime:
+            return  # already there, and at least as new: keep it
+        if not replace_older:
+            raise RuntimeError(f"{d_file} already holds a conversation; not overwriting it")
     dst.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src / f"{session}.jsonl", dst / f"{session}.jsonl")
+    shutil.copy2(s_file, d_file)
     if (src / session).is_dir():
         shutil.copytree(src / session, dst / session, dirs_exist_ok=True)
 
@@ -774,7 +806,7 @@ def cmd_retire(cfg: Config, args) -> None:
         wt.rename(retired / wt.name)
     else:
         if has_transcript(a.real, a.sid):
-            _copy_conversation(a.sid, a.real, retired / wt.name)
+            _copy_conversation(a.sid, a.real, retired / wt.name, replace_older=True)
         _relocate(wt, retired / wt.name)
     a.json_path.rename(retired / a.json_path.name)
     print(f"Retired {a.name} to {retired}.")
@@ -790,7 +822,7 @@ def cmd_revive(cfg: Config, args) -> None:
         wt.rename(cfg.root / wt.name)
     else:
         if has_transcript(a.real, a.sid):
-            _copy_conversation(a.sid, a.real, cfg.root / wt.name)
+            _copy_conversation(a.sid, a.real, cfg.root / wt.name, replace_older=True)
         _relocate(wt, cfg.root / wt.name)
     a.json_path.rename(cfg.root / a.json_path.name)
     Agent(a.sid, cfg.root, read_json(cfg.root / a.json_path.name)).update(stopped=None)

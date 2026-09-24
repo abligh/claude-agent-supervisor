@@ -442,3 +442,50 @@ def test_the_claude_ai_link_comes_from_the_conversation(home: Path) -> None:
         for bridge in ("cse_OLD", "cse_01J8zb"):
             f.write(json.dumps({"type": "bridge-session", "bridgeSessionId": bridge}) + "\n")
     assert ca.remote_link(a.real, a.sid) == "https://claude.ai/code/session_01J8zb"
+
+
+# --- the incident: a leftover old-layout directory must never touch a live agent ------
+
+
+def test_a_leftover_old_directory_never_touches_the_live_conversation(home: Path) -> None:
+    """A directory reappearing at an agent's old path (Docker recreating a bind
+    mount did it) once made the supervisor copy the stale conversation there
+    over the agent's live one, every tick."""
+    root = home / "agents"
+    live = _agent(home, "claude-dev")
+    live_file = ca.project_dir(live.real) / f"{live.sid}.jsonl"
+    live_file.write_text('{"said": "everything since"}\n')
+    old = root / "claude-dev"
+    (old / "tests").mkdir(parents=True)
+    _conversation(old, live.sid, age=3600)  # the stale copy under the old path
+
+    sup = ca.Supervisor(_cfg(home))
+    sup.tick()
+    sup.tick()
+
+    assert live_file.read_text() == '{"said": "everything since"}\n'
+    assert (old / "tests").is_dir()  # left alone, not moved or merged
+    assert [a.sid for a in ca.list_agents(root)] == [live.sid]
+    assert sup.reported == {"claude-dev"}  # reported, once
+
+
+def test_an_empty_directory_is_not_turned_into_an_agent(home: Path) -> None:
+    (home / "agents" / "scratch").mkdir()
+    ca.Supervisor(_cfg(home)).tick()
+    assert ca.list_agents(home / "agents") == []
+    assert (home / "agents" / "scratch").is_dir()
+
+
+def test_copying_never_overwrites_a_newer_conversation(home: Path) -> None:
+    a, b = home / "a", home / "b"
+    a.mkdir(), b.mkdir()
+    _conversation(a, "s", age=100)
+    newer = _conversation(b, "s")
+    newer.write_text("newer\n")
+    ca._copy_conversation("s", a, b)  # kept: the destination is newer
+    assert newer.read_text() == "newer\n"
+    os.utime(newer, (time.time() - 1000, time.time() - 1000))
+    with pytest.raises(RuntimeError, match="not overwriting"):
+        ca._copy_conversation("s", a, b)  # older, but not ours to replace
+    ca._copy_conversation("s", a, b, replace_older=True)
+    assert newer.read_text() != "newer\n"
