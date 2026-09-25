@@ -673,6 +673,7 @@ def test_programs_cannot_rename_the_windows(home: Path) -> None:
     ca.write_tmux_conf()
     conf = (ca.state_dir() / "tmux.conf").read_text()
     assert "automatic-rename off" in conf and "allow-rename off" in conf
+    assert "bind-key s choose-tree" in conf and "#{W:#{window_name}}" in conf
 
 
 # --- stopping without leaving a fork; reporting forks ---------------------------

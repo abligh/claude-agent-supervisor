@@ -423,6 +423,10 @@ def write_tmux_conf() -> None:
         # program in the pane does may rename it.
         "set -g automatic-rename off\n"
         "set -g allow-rename off\n"
+        # C-b s lists sessions, whose names are session IDs: show each one's
+        # agent (its window's name) instead.
+        "bind-key s choose-tree -Zs -F "
+        "'#{?window_format,#{window_name},#{W:#{window_name}}}'\n"
     )
 
 
