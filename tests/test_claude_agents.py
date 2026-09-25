@@ -635,3 +635,41 @@ def test_config_reads_the_alert_settings(tmp_path: Path) -> None:
     cfg = ca.load_config(conf)
     assert (cfg.alert_cmd, cfg.alert_after, cfg.host) == ("curl -s x", 90.0, "h2")
     assert "AGENTS_ALERT_CMD" not in cfg.session_env
+
+
+# --- tmux windows named after their agents ------------------------------------
+
+
+def test_the_tmux_window_follows_the_agents_name(home: Path, monkeypatch, no_tmux) -> None:
+    """Sessions stay keyed by session ID; the window shows the name, so C-b s
+    and C-b w list agents by name."""
+    monkeypatch.setattr(ca, "tmux", lambda *args: no_tmux.append(args)
+                        or subprocess.CompletedProcess(args, 0, "", ""))
+    a = _agent(home, "Builder")
+    live = {"sessionId": a.sid, "name": "Builder"}
+    monkeypatch.setattr(ca, "live_session", lambda pid: live)
+    sup = ca.Supervisor(_cfg(home))
+    renames = lambda: [c for c in no_tmux if c[0] == "rename-window"]  # noqa: E731
+    sup._follow(a, ca.Pane(False, 1, ""))
+    sup._follow(a, ca.Pane(False, 1, ""))
+    assert renames() == [("rename-window", "-t", f"={a.sid}:", "Builder")]  # once, not per poll
+    live = {"sessionId": a.sid, "name": "Architect"}
+    sup._follow(ca.resolve(_cfg(home), a.sid), ca.Pane(False, 1, ""))
+    assert renames()[-1] == ("rename-window", "-t", f"={a.sid}:", "Architect")
+
+
+def test_a_new_tmux_session_is_named_by_id_with_the_window_named_by_agent(
+        home: Path, monkeypatch, no_tmux) -> None:
+    a = _agent(home, "Builder")
+    monkeypatch.setattr(ca, "pane", lambda name: None)
+    monkeypatch.setattr(ca, "tmux", lambda *args: no_tmux.append(args)
+                        or subprocess.CompletedProcess(args, 0, "", ""))
+    ca.start(a, _cfg(home))
+    new = next(c for c in no_tmux if c[0] == "new-session")
+    assert new[new.index("-s") + 1] == a.sid and new[new.index("-n") + 1] == "Builder"
+
+
+def test_programs_cannot_rename_the_windows(home: Path) -> None:
+    ca.write_tmux_conf()
+    conf = (ca.state_dir() / "tmux.conf").read_text()
+    assert "automatic-rename off" in conf and "allow-rename off" in conf

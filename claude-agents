@@ -391,6 +391,11 @@ def write_tmux_conf() -> None:
         "# Written by claude-agents.\n"
         "set -g remain-on-exit on\n"      # keep a dead pane, so its exit is seen
         "set -g history-limit 50000\n"
+        # Each window is named after its agent (sessions stay keyed by
+        # session ID), so C-b s / C-b w list agents by name. Nothing the
+        # program in the pane does may rename it.
+        "set -g automatic-rename off\n"
+        "set -g allow-rename off\n"
     )
 
 
@@ -441,7 +446,7 @@ def start(agent: Agent, cfg: Config) -> None:
     if pane(agent.sid) is not None:
         r = tmux("respawn-pane", "-k", "-t", f"={agent.sid}:", "-c", str(agent.real), *env, *args)
     else:
-        r = tmux("new-session", "-d", "-s", agent.sid, "-x", "220", "-y", "50",
+        r = tmux("new-session", "-d", "-s", agent.sid, "-n", agent.name, "-x", "220", "-y", "50",
                  "-c", str(agent.real), *env, *args)
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or f"tmux exited {r.returncode}")
@@ -528,6 +533,7 @@ class Supervisor:
         self.failures: dict[str, int] = {}
         self.reported: set[str] = set()
         self.waiting: dict[str, Waiting] = {}
+        self.window_names: dict[str, str] = {}
         self.stopping = False
 
     def tick(self) -> None:
@@ -602,9 +608,18 @@ class Supervisor:
         else:
             w.retry_at = now + 300
 
+    def _name_window(self, agent: Agent) -> None:
+        """The tmux window shows the agent's current name (the session stays
+        keyed by session ID). Only asks tmux when the name has changed."""
+        if self.window_names.get(agent.sid) == agent.name:
+            return
+        if tmux("rename-window", "-t", f"={agent.sid}:", agent.name).returncode == 0:
+            self.window_names[agent.sid] = agent.name
+
     def _follow(self, agent: Agent, p: Pane) -> None:
         """Keep the JSON in step with the running session: its name, and once
         a fork's own conversation exists, forget the parent."""
+        self._name_window(agent)
         live = live_session(p.pid)
         if live.get("sessionId") != agent.sid:
             return
@@ -612,6 +627,7 @@ class Supervisor:
         if name and name != agent.meta.get("name"):
             log(f"{agent.name}: renamed to {name}")
             agent.update(name=name)
+            self._name_window(agent)
         if agent.meta.get("fork_from") and has_transcript(agent.real, agent.sid):
             agent.update(fork_from=None)
 

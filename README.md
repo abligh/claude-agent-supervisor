@@ -84,6 +84,10 @@ claude-agents adopt (--session ID | --dir PATH) [--name NAME] [--move] [--dry-ru
                                             take over a session running elsewhere
 ```
 
+In tmux, each agent is a session named by its session ID, with its one
+window named after the agent and renamed when the agent is. Once attached,
+`C-b s` (or `C-b w`) lists every agent by name and switches between them.
+
 `AGENT` is a name, a session ID or an ID prefix. **Don't move an agent's
 worktree by hand.** Its conversation is filed under the worktree's path, so a
 moved agent would start afresh. `retire`/`revive` move it with its
