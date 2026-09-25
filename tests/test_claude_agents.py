@@ -720,3 +720,20 @@ def test_forks_elsewhere_or_dead_are_not_reported(home: Path) -> None:
     _bg_session_file(home, 999_999_999, kind="bg", sessionId="dead", cwd=str(a.real))
     _bg_session_file(home, 0, kind="bg", sessionId="bad-pid", cwd=str(a.real))
     assert ca.background_forks([a]) == []
+
+
+def test_a_new_agent_can_be_given_an_opening_prompt(home: Path, monkeypatch, tmp_path: Path) -> None:
+    prompt = tmp_path / "PROMPT.md"
+    prompt.write_text("# Hello\nYour name is Builder.\n")
+    ca.cmd_new(_cfg(home), argparse.Namespace(name="Builder", dir=None, repo=None,
+                                              prompt_file=str(prompt)))
+    a = ca.resolve(_cfg(home), "Builder")
+    args = ca.claude_args(a, _cfg(home))
+    assert args[-1] == "# Hello\nYour name is Builder." and "--session-id" in args
+    # Once the conversation exists: resumed, and the prompt is never sent again.
+    _conversation(a.real, a.sid)
+    monkeypatch.setattr(ca, "live_session", lambda pid: {"sessionId": a.sid, "name": "Builder"})
+    ca.Supervisor(_cfg(home))._follow(a, ca.Pane(False, 1, ""))
+    a = ca.resolve(_cfg(home), "Builder")
+    assert "first_prompt" not in a.meta
+    assert ca.claude_args(a, _cfg(home))[-2:] == ["--resume", a.sid]

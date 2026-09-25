@@ -269,6 +269,11 @@ def claude_args(agent: Agent, cfg: Config) -> list[str]:
         args += ["--resume", agent.meta["fork_from"], "--fork-session", "--session-id", agent.sid]
     else:
         args += ["--session-id", agent.sid]
+        if agent.meta.get("first_prompt"):
+            # A new agent's opening prompt, given once: the conversation it
+            # starts is resumed ever after, and the prompt is dropped from
+            # the JSON as soon as that conversation exists (_follow).
+            return args + cfg.extra_args + [agent.meta["first_prompt"]]
     return args + cfg.extra_args
 
 
@@ -688,6 +693,8 @@ class Supervisor:
             self._name_window(agent)
         if agent.meta.get("fork_from") and has_transcript(agent.real, agent.sid):
             agent.update(fork_from=None)
+        if agent.meta.get("first_prompt") and has_transcript(agent.real, agent.sid):
+            agent.update(first_prompt=None)
 
     def run(self) -> None:
         write_tmux_conf()
@@ -919,7 +926,13 @@ def cmd_attach(cfg: Config, args) -> None:
 
 
 def cmd_new(cfg: Config, args) -> None:
-    a = create(cfg, args.name, dir=args.dir, repo=args.repo)
+    meta = {}
+    if args.prompt_file:
+        text = Path(args.prompt_file).expanduser().read_text().strip()
+        if not text:
+            sys.exit(f"claude-agents: {args.prompt_file} is empty")
+        meta["first_prompt"] = text
+    a = create(cfg, args.name, dir=args.dir, repo=args.repo, **meta)
     print(f"Added {a.name} ({a.sid}); the supervisor starts it within {cfg.poll:.0f}s.")
 
 
@@ -1110,6 +1123,7 @@ def main(argv: list[str] | None = None) -> None:
     g = p.add_mutually_exclusive_group()
     g.add_argument("--dir", help="work in this directory (a symlink to it)")
     g.add_argument("--repo", help="work in a new git worktree of this repository")
+    p.add_argument("--prompt-file", help="the agent's opening prompt, sent when it first starts")
     p = sub.add_parser("fork")
     p.add_argument("agent")
     p.add_argument("name")

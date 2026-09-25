@@ -70,9 +70,10 @@ under the new path, writes the JSON, and resumes it.
 claude-agents list                          agents, state, session IDs, claude.ai links
 claude-agents attach AGENT                  its terminal (tmux; detach with C-b d)
 
-claude-agents new NAME [--dir PATH | --repo PATH]
+claude-agents new NAME [--dir PATH | --repo PATH] [--prompt-file FILE]
                                             a new agent: in a new directory, a symlink
                                             to PATH, or a new git worktree of PATH
+                                            (FILE: its opening prompt, sent once)
 claude-agents fork AGENT NAME [--dir PATH]  a new agent from a copy of AGENT's conversation
 claude-agents rename AGENT NAME
 claude-agents stop AGENT                    pause it; it stays stopped
