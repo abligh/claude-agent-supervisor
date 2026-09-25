@@ -673,3 +673,49 @@ def test_programs_cannot_rename_the_windows(home: Path) -> None:
     ca.write_tmux_conf()
     conf = (ca.state_dir() / "tmux.conf").read_text()
     assert "automatic-rename off" in conf and "allow-rename off" in conf
+
+
+# --- stopping without leaving a fork; reporting forks ---------------------------
+
+
+def test_stop_sends_sigterm_not_ctrl_c(home: Path, monkeypatch, no_tmux) -> None:
+    """Ctrl-C twice with a background task running offers "move to background
+    and exit", which forks the agent; SIGTERM exits and leaves no fork."""
+    killed = []
+    monkeypatch.setattr(ca, "pane", lambda n: ca.Pane(False, 4242, "") if not killed else None)
+    monkeypatch.setattr(ca.os, "kill", lambda pid, sig: killed.append((pid, sig)))
+    ca.stop("sess-1", wait=1)
+    assert killed == [(4242, ca.signal.SIGTERM)]
+    assert not any(c[0] == "send-keys" for c in no_tmux)
+    assert ("kill-session", "-t", "=sess-1") in no_tmux
+
+
+def _bg_session_file(home: Path, pid: int, **d) -> None:
+    f = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "sessions" / f"{pid}.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps({"pid": pid, **d}))
+
+
+def test_a_background_fork_of_an_agent_is_reported_once(home: Path, monkeypatch) -> None:
+    a = _agent(home, "Builder")
+    me = os.getpid()  # a live pid to stand for the fork
+    _bg_session_file(home, me, kind="bg", sessionId="fork-1", cwd=str(a.real / "sub"))
+    _bg_session_file(home, me + 1, kind="interactive", sessionId=a.sid, cwd=str(a.real))
+    assert [(x.name, pid, sid) for x, pid, sid in ca.background_forks([a])] == [
+        ("Builder", me, "fork-1")]
+    alerts = _Alerts()
+    monkeypatch.setattr(ca, "send_alert", alerts)
+    sup = ca.Supervisor(_cfg(home, alert_cmd="true", host="host1"))
+    sup._report_forks([a])
+    sup._report_forks([a])
+    assert len(alerts.sent) == 1
+    event, text = alerts.sent[0]
+    assert event == "fork" and "fork-1" in text and f"kill {me}" in text
+
+
+def test_forks_elsewhere_or_dead_are_not_reported(home: Path) -> None:
+    a = _agent(home, "Builder")
+    _bg_session_file(home, os.getpid(), kind="bg", sessionId="other", cwd="/somewhere/else")
+    _bg_session_file(home, 999_999_999, kind="bg", sessionId="dead", cwd=str(a.real))
+    _bg_session_file(home, 0, kind="bg", sessionId="bad-pid", cwd=str(a.real))
+    assert ca.background_forks([a]) == []

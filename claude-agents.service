@@ -6,7 +6,7 @@
 # Install: copy to /etc/systemd/system/, adjust User= and the paths, then
 #   systemctl daemon-reload && systemctl enable --now claude-agents
 #
-# Stopping it asks every agent to exit cleanly (Ctrl-C twice) and waits; each
+# Stopping it asks every agent to exit cleanly (SIGTERM) and waits; each
 # resumes its conversation when the supervisor next starts.
 
 [Unit]

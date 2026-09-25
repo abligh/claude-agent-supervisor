@@ -29,7 +29,13 @@ Facts it depends on (Claude Code 2.1.281; re-check on upgrades):
 - `claude remote-control` (the server) rejects `--channels`; the interactive
   `--remote-control` accepts it. Unapproved channels need a confirmation on
   every start, so unattended agents need `allowedChannelPlugins`.
-- Ctrl-C twice is Claude Code's clean exit.
+- SIGTERM is the clean stop: Claude Code exits, stops the session's background
+  tasks and leaves no fork. Ctrl-C twice is not: with a background task
+  running, 2.1.282 asks "Exit and stop tasks / Move to background and exit /
+  Stay", and "move to background" forks the session (`"kind": "bg"` in its
+  session file, a `continued-in` record in the parent's transcript) under
+  Claude Code's daemon, with the agent's name, channels and directory. A
+  first Ctrl-C can also only clear a suggested prompt.
 - `--session-id <uuid>` names a new session, and combined with
   `--resume <parent> --fork-session` names the fork: agents' IDs are known
   before they first run, which is why the layout can be keyed by them.

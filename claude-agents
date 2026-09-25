@@ -277,6 +277,33 @@ def live_session(pid: int) -> dict:
     return read_json(claude_home() / "sessions" / f"{pid}.json")
 
 
+def background_forks(agents: list[Agent]) -> list[tuple[Agent, int, str]]:
+    """Live Claude Code background sessions running in an agent's directory.
+
+    Claude Code offers "move to background and exit" when a session with a
+    running background task is interrupted at the terminal. The result is a
+    fork, a new session under Claude Code's daemon, with the agent's name,
+    channels and working directory, doing the agent's work beside it.
+    (agent, pid, session ID) for each.
+    """
+    found = []
+    homes = {a.real.resolve(): a for a in agents}
+    for f in (claude_home() / "sessions").glob("*.json"):
+        d = read_json(f)
+        pid = d.get("pid")
+        # A positive int only: os.kill(-1, 0) would ask about every process.
+        if d.get("kind") != "bg" or not isinstance(pid, int) or pid <= 0 or not _alive(pid):
+            continue
+        try:
+            cwd = Path(d.get("cwd") or "").resolve()
+        except OSError:
+            continue
+        agent = next((a for home, a in homes.items() if cwd == home or home in cwd.parents), None)
+        if agent is not None:
+            found.append((agent, pid, str(d.get("sessionId", "?"))))
+    return found
+
+
 def resolve(cfg: Config, key: str, agents: list[Agent] | None = None) -> Agent:
     """An agent by session ID, ID prefix (4+ characters) or current name."""
     agents = list_agents(cfg.root) if agents is None else agents
@@ -423,13 +450,23 @@ def tmux_sessions() -> set[str]:
 
 
 def stop(*names: str, wait: float = 20.0) -> None:
-    """Claude Code's own clean exit (Ctrl-C twice) for each, together; then
-    remove their tmux sessions."""
-    running = [n for n in names if (p := pane(n)) and not p.dead]
-    for key_press in (1, 2):
-        for n in running:
-            tmux("send-keys", "-t", f"={n}:", "C-c")
-        time.sleep(1)
+    """Stop each agent's Claude Code cleanly, together; then remove their tmux
+    sessions.
+
+    SIGTERM, not Ctrl-C twice. Claude Code 2.1.282 answers Ctrl-C twice with a
+    running background task by asking whether to exit, "move to background
+    and exit" (a fork of the session that carries on under the daemon, with
+    the agent's name and channels) or stay. A first Ctrl-C can also merely
+    clear a suggested prompt. SIGTERM exits at once, stops the session's
+    background tasks and leaves no fork. The conversation is on disk as it
+    goes, so the next start resumes it.
+    """
+    running = {n: p for n in names if (p := pane(n)) and not p.dead}
+    for p in running.values():
+        try:
+            os.kill(p.pid, signal.SIGTERM)
+        except OSError:
+            pass
     deadline = time.monotonic() + wait
     while time.monotonic() < deadline and any((p := pane(n)) and not p.dead for n in running):
         time.sleep(0.5)
@@ -534,6 +571,7 @@ class Supervisor:
         self.reported: set[str] = set()
         self.waiting: dict[str, Waiting] = {}
         self.window_names: dict[str, str] = {}
+        self.forks_reported: set[str] = set()
         self.stopping = False
 
     def tick(self) -> None:
@@ -553,6 +591,7 @@ class Supervisor:
         for sid in list(self.waiting):
             if sid not in agents:
                 self.waiting.pop(sid)
+        self._report_forks(list(agents.values()))
         for sid, agent in agents.items():
             p = pane(sid)
             if self.cfg.alert_cmd:
@@ -607,6 +646,21 @@ class Supervisor:
             log(f"{agent.name}: waiting at a prompt; alert sent")
         else:
             w.retry_at = now + 300
+
+    def _report_forks(self, agents: list[Agent]) -> None:
+        """Say once about each background fork of an agent. Never stop one:
+        whoever made it at the terminal may want it; the report says how."""
+        for agent, pid, fork_sid in background_forks(agents):
+            if fork_sid in self.forks_reported:
+                continue
+            self.forks_reported.add(fork_sid)
+            text = (f"{agent.name} on {self.cfg.host} has a background fork: session "
+                    f"{fork_sid}, pid {pid}, in its directory (\"move to background\" at "
+                    f"its terminal). It carries on with {agent.name}'s work beside it. "
+                    f"Stop it with: kill {pid}")
+            log(text)
+            if self.cfg.alert_cmd:
+                send_alert(self.cfg, agent, "fork", text)
 
     def _name_window(self, agent: Agent) -> None:
         """The tmux window shows the agent's current name (the session stays

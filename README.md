@@ -120,6 +120,15 @@ more when the dialog goes. The command decides where alerts go: chat, mail, a
 push service (`config.example.env` sends them to a chat room). Answer the
 dialog with `claude-agents attach AGENT`.
 
+**Background forks.** Interrupting an agent at its terminal (Ctrl-C twice)
+while it has a background task running makes Claude Code offer "move to
+background and exit". That forks the session under Claude Code's daemon, and
+the fork carries on with the agent's work, under its name, beside the agent
+the supervisor restarts. The supervisor never stops agents that way: it uses
+SIGTERM, which leaves no fork. It reports any fork of an agent it finds, once,
+in its log and through `AGENTS_ALERT_CMD`, with the command to stop it. To
+detach from an agent's terminal, use `C-b d`, not Ctrl-C.
+
 **What can't be done**: creating an agent from the Claude app's "new
 session". That belongs to the Remote Control server. Create agents by
 command, or ask an agent to.
