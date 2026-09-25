@@ -49,6 +49,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -94,6 +95,9 @@ class Config:
     extra_args: list[str] = field(default_factory=list)
     poll: float = 5.0
     session_env: dict[str, str] = field(default_factory=dict)
+    alert_cmd: str = ""
+    alert_after: float = 60.0
+    host: str = ""
 
     @property
     def plugins(self) -> list[str]:
@@ -124,6 +128,9 @@ def load_config(path: Path | None = None) -> Config:
         extra_args=shlex.split(own.get("AGENTS_CLAUDE_ARGS", "")),
         poll=float(own.get("AGENTS_POLL", "5")),
         session_env=values,
+        alert_cmd=own.get("AGENTS_ALERT_CMD", ""),
+        alert_after=float(own.get("AGENTS_ALERT_AFTER", "60")),
+        host=own.get("AGENTS_HOST", "") or socket.gethostname().split(".")[0],
     )
 
 
@@ -444,6 +451,72 @@ def start(agent: Agent, cfg: Config) -> None:
     log(f"{agent.name} ({agent.sid}): started in {agent.real} ({how})")
 
 
+# --- waiting at a prompt ------------------------------------------------------------
+
+# A dialog waiting for someone at the terminal: a numbered choice with the
+# cursor on it, and the footer every one of Claude Code's dialogs has. Remote
+# Control does not pass every dialog on to the app (auto mode's "N consecutive
+# actions were blocked" confirmation, for one), so an unattended agent can sit
+# at one for hours with nothing to show for it anywhere but its terminal.
+_CHOICE = re.compile(r"^\s*[❯>]\s*1\.\s")
+_FOOTER = "Esc to cancel"
+_RULE = re.compile(r"^\s*[─━]{10,}")
+
+
+def screen(name: str) -> str | None:
+    """The visible text of the agent's terminal, or None."""
+    r = tmux("capture-pane", "-p", "-t", f"={name}:")
+    return r.stdout if r.returncode == 0 else None
+
+
+def waiting_prompt(text: str | None) -> str | None:
+    """What a dialog at the bottom of the screen asks, or None if there is none.
+
+    The dialog is the block below the last horizontal rule, up to the footer;
+    box-drawing and blank lines are dropped and the rest joined, so the text
+    names the tool, the command and, for auto mode, the reason it stopped.
+    """
+    if not text:
+        return None
+    lines = text.rstrip().splitlines()[-40:]
+    footer = next((i for i in range(len(lines) - 1, -1, -1) if _FOOTER in lines[i]), None)
+    if footer is None or not any(_CHOICE.match(line) for line in lines[:footer]):
+        return None
+    top = max((i for i in range(footer) if _RULE.match(lines[i])), default=-1) + 1
+    body = []
+    for line in lines[top:footer]:
+        line = line.strip().strip("│╭╮╰╯").strip()
+        if line and not _CHOICE.match(line) and not re.match(r"^\d+\.\s", line):
+            body.append(line)
+    summary = " ".join(" ".join(body).split())
+    return summary[:600] or "a dialog"
+
+
+@dataclass
+class Waiting:
+    since: float
+    what: str
+    alerted: bool = False
+    retry_at: float = 0.0
+
+
+def send_alert(cfg: Config, agent: Agent, event: str, text: str) -> bool:
+    """Run AGENTS_ALERT_CMD with the text on stdin. True if it succeeded."""
+    env = dict(os.environ, ALERT_EVENT=event, ALERT_AGENT=agent.name,
+               ALERT_SESSION=agent.sid, ALERT_HOST=cfg.host)
+    try:
+        r = subprocess.run(["sh", "-c", cfg.alert_cmd], input=text, text=True, env=env,
+                           capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"{agent.name}: alert command failed: {exc}")
+        return False
+    if r.returncode != 0:
+        log(f"{agent.name}: alert command exited {r.returncode}: "
+            f"{(r.stderr or r.stdout).strip()[:200]}")
+        return False
+    return True
+
+
 # --- the supervisor -----------------------------------------------------------------
 
 
@@ -454,6 +527,7 @@ class Supervisor:
         self.not_before: dict[str, float] = {}
         self.failures: dict[str, int] = {}
         self.reported: set[str] = set()
+        self.waiting: dict[str, Waiting] = {}
         self.stopping = False
 
     def tick(self) -> None:
@@ -470,8 +544,14 @@ class Supervisor:
             log(f"{', '.join(sorted(gone))}: no longer an agent; stopping")
             stop(*gone)
         now = time.monotonic()
+        for sid in list(self.waiting):
+            if sid not in agents:
+                self.waiting.pop(sid)
         for sid, agent in agents.items():
             p = pane(sid)
+            if self.cfg.alert_cmd:
+                live = p is not None and not p.dead and not agent.meta.get("stopped")
+                self._watch(agent, waiting_prompt(screen(sid)) if live else None, now)
             if agent.meta.get("stopped"):
                 if p:
                     log(f"{agent.name}: stopped by request")
@@ -494,6 +574,33 @@ class Supervisor:
             except (RuntimeError, OSError) as exc:
                 log(f"{agent.name}: could not start: {exc}")
                 self.not_before[sid] = now + 60
+
+    def _watch(self, agent: Agent, what: str | None, now: float) -> None:
+        """Alert once when the agent has sat at a dialog for AGENTS_ALERT_AFTER
+        seconds, and once more when it is gone. A different dialog is a new wait."""
+        w = self.waiting.get(agent.sid)
+        if w and w.what != what:
+            if w.alerted:
+                gone = "a different one" if what else "answered, or gone"
+                send_alert(self.cfg, agent, "cleared",
+                           f"{agent.name} on {self.cfg.host} is no longer waiting "
+                           f"({gone}, after {_minutes(now - w.since)}).")
+            self.waiting.pop(agent.sid)
+            w = None
+        if what is None:
+            return
+        if w is None:
+            w = self.waiting[agent.sid] = Waiting(since=now, what=what)
+        if w.alerted or now - w.since < self.cfg.alert_after or now < w.retry_at:
+            return
+        text = (f"{agent.name} on {self.cfg.host} has been waiting at a prompt for "
+                f"{_minutes(now - w.since)}: {what}\n"
+                f"Answer it at the terminal: claude-agents attach {agent.name}")
+        if send_alert(self.cfg, agent, "waiting", text):
+            w.alerted = True
+            log(f"{agent.name}: waiting at a prompt; alert sent")
+        else:
+            w.retry_at = now + 300
 
     def _follow(self, agent: Agent, p: Pane) -> None:
         """Keep the JSON in step with the running session: its name, and once
@@ -526,6 +633,11 @@ class Supervisor:
         stop(*tmux_sessions())
         tmux("kill-server")
 
+
+
+def _minutes(seconds: float) -> str:
+    m = int(seconds // 60)
+    return f"{m} min" if m else f"{int(seconds)} s"
 
 
 # --- adopting a session that runs elsewhere, and moving agents ------------------------

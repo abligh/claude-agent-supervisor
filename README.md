@@ -105,6 +105,17 @@ own claude.ai session, and its own identity on any channel that derives one
 from the session. The parent carries on untouched. An agent can fork itself
 by running the command.
 
+**Stuck at a prompt.** Remote Control doesn't pass every dialog to the app:
+auto mode's confirmation after repeated blocks ("4 consecutive actions were
+blocked … Do you want to proceed?") appears only in the terminal, so the app
+shows an agent that simply never answers. With `AGENTS_ALERT_CMD` set, the
+supervisor looks at each agent's screen on every poll. When one has sat at a
+dialog for `AGENTS_ALERT_AFTER` seconds, it runs the command once with a
+message naming the agent, the host and what the dialog asks. It runs it once
+more when the dialog goes. The command decides where alerts go: chat, mail, a
+push service (`config.example.env` sends them to a chat room). Answer the
+dialog with `claude-agents attach AGENT`.
+
 **What can't be done**: creating an agent from the Claude app's "new
 session". That belongs to the Remote Control server. Create agents by
 command, or ask an agent to.

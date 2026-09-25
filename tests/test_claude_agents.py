@@ -489,3 +489,149 @@ def test_copying_never_overwrites_a_newer_conversation(home: Path) -> None:
         ca._copy_conversation("s", a, b)  # older, but not ours to replace
     ca._copy_conversation("s", a, b, replace_older=True)
     assert newer.read_text() != "newer\n"
+
+
+# --- waiting at a prompt ------------------------------------------------------------
+
+# What a stuck agent's terminal looked like: auto mode's confirmation after
+# repeated classifier blocks, which Remote Control did not show in the app.
+STUCK = """\
+● That attempt was denied too, so I'll hold off.
+  Ran 1 shell command
+❯ You seem to have become stuck.
+──────────────────────────────────────────────────────────────────────────
+ Bash command
+   │ cd /home/claude/wt/fix-12 && git fetch -q origin && gh issue view 12
+   │ --json state -q .state; echo done
+   Confirm #13 merged and #12 closed
+ │ Auto mode classifier requires confirmation for this command.
+ │ 4 consecutive actions were blocked. Please review the transcript before continuing.
+ │
+ │ Latest blocked action: [Shared Scratch Sweep]
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+ Esc to cancel · Tab to amend
+"""
+
+IDLE = """\
+● Done. Nothing else is waiting.
+──────────────────────────────────────────────────────────────────────────
+❯ 
+──────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+"""
+
+
+def test_a_dialog_is_recognised_and_summarised() -> None:
+    what = ca.waiting_prompt(STUCK)
+    assert what.startswith("Bash command cd /home/claude/wt/fix-12 && git fetch")
+    assert "[Shared Scratch Sweep]" in what and "Do you want to proceed?" in what
+    assert "1. Yes" not in what and "Esc to cancel" not in what
+    assert "You seem to have become stuck" not in what  # above the dialog
+
+
+@pytest.mark.parametrize("text", [IDLE, "", None,
+                                  # a list that isn't a dialog: no footer
+                                  "Pick one:\n ❯ 1. first\n   2. second\n"])
+def test_no_dialog_no_prompt(text) -> None:
+    assert ca.waiting_prompt(text) is None
+
+
+def test_the_workspace_trust_dialog_counts_too() -> None:
+    trust = ("──────────────\n Accessing workspace:\n /home/claude/agents\n"
+             " ❯ 1. Yes, I trust this folder\n   2. No, exit\n"
+             " Enter to confirm · Esc to cancel\n")
+    assert ca.waiting_prompt(trust) == "Accessing workspace: /home/claude/agents"
+
+
+class _Alerts:
+    def __init__(self, ok: bool = True) -> None:
+        self.sent: list[tuple[str, str]] = []
+        self.ok = ok
+
+    def __call__(self, cfg, agent, event, text):
+        self.sent.append((event, text))
+        return self.ok
+
+
+def _watcher(home: Path, monkeypatch, ok: bool = True):
+    alerts = _Alerts(ok)
+    monkeypatch.setattr(ca, "send_alert", alerts)
+    cfg = _cfg(home, alert_cmd="true", alert_after=60, host="host1")
+    agent = ca.create(cfg, "Builder")
+    return ca.Supervisor(cfg), agent, alerts
+
+
+def test_one_alert_after_the_delay_and_one_when_it_clears(home: Path, monkeypatch) -> None:
+    sup, agent, alerts = _watcher(home, monkeypatch)
+    what = ca.waiting_prompt(STUCK)
+    sup._watch(agent, what, now=1000)
+    sup._watch(agent, what, now=1059)
+    assert alerts.sent == []  # a prompt someone is about to answer is no news
+    sup._watch(agent, what, now=1061)
+    sup._watch(agent, what, now=2000)
+    assert [e for e, _ in alerts.sent] == ["waiting"]  # once, not every poll
+    event, text = alerts.sent[0]
+    assert text.startswith("Builder on host1 has been waiting at a prompt for 1 min: Bash")
+    assert "claude-agents attach Builder" in text
+    sup._watch(agent, None, now=2100)
+    assert alerts.sent[-1][0] == "cleared" and "after 18 min" in alerts.sent[-1][1]
+    sup._watch(agent, None, now=2200)
+    assert len(alerts.sent) == 2
+
+
+def test_a_prompt_answered_quickly_says_nothing(home: Path, monkeypatch) -> None:
+    sup, agent, alerts = _watcher(home, monkeypatch)
+    sup._watch(agent, "Bash command ls", now=0)
+    sup._watch(agent, None, now=30)
+    assert alerts.sent == [] and not sup.waiting
+
+
+def test_a_different_dialog_is_a_new_wait(home: Path, monkeypatch) -> None:
+    sup, agent, alerts = _watcher(home, monkeypatch)
+    sup._watch(agent, "Bash command one", now=0)
+    sup._watch(agent, "Bash command one", now=61)
+    sup._watch(agent, "Bash command two", now=62)  # the first was answered
+    assert [e for e, _ in alerts.sent] == ["waiting", "cleared"]
+    sup._watch(agent, "Bash command two", now=100)
+    assert len(alerts.sent) == 2  # the new one has only waited 38 s
+    sup._watch(agent, "Bash command two", now=123)
+    assert alerts.sent[-1][0] == "waiting" and "two" in alerts.sent[-1][1]
+
+
+def test_a_failed_alert_is_retried_later_not_every_poll(home: Path, monkeypatch) -> None:
+    sup, agent, alerts = _watcher(home, monkeypatch, ok=False)
+    for t in (0, 61, 66, 71):
+        sup._watch(agent, "Bash command x", now=t)
+    assert len(alerts.sent) == 1
+    alerts.ok = True
+    sup._watch(agent, "Bash command x", now=361)
+    assert len(alerts.sent) == 2 and sup.waiting[agent.sid].alerted
+
+
+def test_the_alert_command_gets_the_text_and_the_facts(home: Path) -> None:
+    out = home / "alert.txt"
+    cfg = _cfg(home, alert_cmd=f'{{ echo "$ALERT_EVENT $ALERT_AGENT $ALERT_HOST"; cat; }} > {out}',
+               host="host1")
+    agent = ca.create(cfg, "Builder")
+    assert ca.send_alert(cfg, agent, "waiting", "the text")
+    assert out.read_text() == "waiting Builder host1\nthe text"
+    assert not ca.send_alert(_cfg(home, alert_cmd="exit 3"), agent, "waiting", "x")
+
+
+def test_no_alert_command_no_watching(home: Path, monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(ca, "screen", lambda name: calls.append(name) or STUCK)
+    cfg = _cfg(home)
+    ca.create(cfg, "Builder")
+    ca.Supervisor(cfg).tick()
+    assert calls == []
+
+
+def test_config_reads_the_alert_settings(tmp_path: Path) -> None:
+    conf = tmp_path / "config.env"
+    conf.write_text("AGENTS_ALERT_CMD=curl -s x\nAGENTS_ALERT_AFTER=90\nAGENTS_HOST=h2\n")
+    cfg = ca.load_config(conf)
+    assert (cfg.alert_cmd, cfg.alert_after, cfg.host) == ("curl -s x", 90.0, "h2")
+    assert "AGENTS_ALERT_CMD" not in cfg.session_env
