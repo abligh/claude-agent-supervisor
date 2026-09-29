@@ -273,8 +273,15 @@ def claude_args(agent: Agent, cfg: Config) -> list[str]:
             # A new agent's opening prompt, given once: the conversation it
             # starts is resumed ever after, and the prompt is dropped from
             # the JSON as soon as that conversation exists (_follow).
-            return args + cfg.extra_args + [agent.meta["first_prompt"]]
-    return args + cfg.extra_args
+            return args + cfg.extra_args + model_args(agent) + [agent.meta["first_prompt"]]
+    return args + cfg.extra_args + model_args(agent)
+
+
+def model_args(agent: Agent) -> list[str]:
+    """`--model` from the agent's JSON, after AGENTS_CLAUDE_ARGS so that an
+    agent's own model wins over the host's default."""
+    model = agent.meta.get("model")
+    return ["--model", model] if model else []
 
 
 def live_session(pid: int) -> dict:
@@ -953,6 +960,8 @@ def cmd_new(cfg: Config, args) -> None:
         if not text:
             sys.exit(f"claude-agents: {args.prompt_file} is empty")
         meta["first_prompt"] = text
+    if args.model:
+        meta["model"] = args.model
     # A new agent starts from the remote's current default branch, not the
     # checkout's HEAD (a fork starts from its parent's HEAD instead).
     base = remote_base(args.repo) if args.repo else None
@@ -1148,6 +1157,7 @@ def main(argv: list[str] | None = None) -> None:
     g.add_argument("--dir", help="work in this directory (a symlink to it)")
     g.add_argument("--repo", help="work in a new git worktree of this repository")
     p.add_argument("--prompt-file", help="the agent's opening prompt, sent when it first starts")
+    p.add_argument("--model", help="the agent's model (claude --model), on every start")
     p = sub.add_parser("fork")
     p.add_argument("agent")
     p.add_argument("name")

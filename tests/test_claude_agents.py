@@ -155,7 +155,7 @@ def test_new_starts_from_the_remotes_main_not_a_stale_checkout(home: Path, tmp_p
     subprocess.run(["git", "-C", str(upstream), "add", "."], check=True)
     subprocess.run(["git", "-C", str(upstream), "commit", "-qm", "later"], check=True)
     ca.cmd_new(_cfg(home), argparse.Namespace(name="sre", dir=None, repo=str(clone),
-                                              prompt_file=None))
+                                              prompt_file=None, model=None))
     a = ca.resolve(_cfg(home), "sre")
     assert (a.worktree / "later.txt").exists()
     upstream_head = subprocess.run(["git", "-C", str(upstream), "rev-parse", "HEAD"],
@@ -754,7 +754,7 @@ def test_a_new_agent_can_be_given_an_opening_prompt(home: Path, monkeypatch, tmp
     prompt = tmp_path / "PROMPT.md"
     prompt.write_text("# Hello\nYour name is Builder.\n")
     ca.cmd_new(_cfg(home), argparse.Namespace(name="Builder", dir=None, repo=None,
-                                              prompt_file=str(prompt)))
+                                              prompt_file=str(prompt), model=None))
     a = ca.resolve(_cfg(home), "Builder")
     args = ca.claude_args(a, _cfg(home))
     assert args[-1] == "# Hello\nYour name is Builder." and "--session-id" in args
@@ -765,3 +765,19 @@ def test_a_new_agent_can_be_given_an_opening_prompt(home: Path, monkeypatch, tmp
     a = ca.resolve(_cfg(home), "Builder")
     assert "first_prompt" not in a.meta
     assert ca.claude_args(a, _cfg(home))[-2:] == ["--resume", a.sid]
+
+
+def test_an_agent_can_have_its_own_model(home: Path) -> None:
+    """Per agent, after the host's AGENTS_CLAUDE_ARGS, so it wins; and on
+    every start, resumed or new."""
+    ca.cmd_new(_cfg(home), argparse.Namespace(name="Researcher", dir=None, repo=None,
+                                              prompt_file=None, model="claude-opus-5-5"))
+    a = ca.resolve(_cfg(home), "Researcher")
+    assert a.meta["model"] == "claude-opus-5-5"
+    args = ca.claude_args(a, _cfg(home, extra_args=["--model", "sonnet"]))
+    assert args[-2:] == ["--model", "claude-opus-5-5"]
+    _conversation(a.real, a.sid)
+    assert ca.claude_args(a, _cfg(home))[-2:] == ["--model", "claude-opus-5-5"]
+    ca.cmd_new(_cfg(home), argparse.Namespace(name="Plain", dir=None, repo=None,
+                                              prompt_file=None, model=None))
+    assert "--model" not in ca.claude_args(ca.resolve(_cfg(home), "Plain"), _cfg(home))
