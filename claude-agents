@@ -324,8 +324,28 @@ def resolve(cfg: Config, key: str, agents: list[Agent] | None = None) -> Agent:
     sys.exit(f"claude-agents: no agent {key!r} in {cfg.root} (see `claude-agents list`)")
 
 
+def remote_base(repo: str) -> str | None:
+    """The ref a new agent's branch should start from: origin's default branch,
+    freshly fetched, or None (use HEAD) when there is no origin. The local
+    HEAD of a checkout is whatever a person last had there, often days old."""
+    git = ["git", "-C", str(Path(repo).expanduser())]
+    if subprocess.run(git + ["remote", "get-url", "origin"],
+                      capture_output=True).returncode != 0:
+        return None
+    subprocess.run(git + ["fetch", "-q", "origin"], capture_output=True)
+    r = subprocess.run(git + ["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"],
+                       capture_output=True, text=True)
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    for ref in ("origin/main", "origin/master"):
+        if subprocess.run(git + ["rev-parse", "-q", "--verify", ref],
+                          capture_output=True).returncode == 0:
+            return ref
+    return None
+
+
 def create(cfg: Config, name: str, *, dir: str | None = None, repo: str | None = None,
-           sid: str | None = None, **meta) -> Agent:
+           sid: str | None = None, base: str | None = None, **meta) -> Agent:
     """Make a new agent's two entries (its conversation starts on first run)."""
     if not NAME_RE.match(name):
         sys.exit(f"claude-agents: {name!r} is not a usable name")
@@ -342,7 +362,8 @@ def create(cfg: Config, name: str, *, dir: str | None = None, repo: str | None =
     elif repo:
         branch = re.sub(r"[^A-Za-z0-9._-]", "-", name)
         r = subprocess.run(["git", "-C", str(Path(repo).expanduser()), "worktree", "add",
-                            "-b", branch, str(wt)], capture_output=True, text=True)
+                            "-b", branch, str(wt), *([base] if base else [])],
+                           capture_output=True, text=True)
         if r.returncode != 0:
             sys.exit(f"claude-agents: git worktree add failed: {r.stderr.strip()}")
     else:
@@ -932,7 +953,10 @@ def cmd_new(cfg: Config, args) -> None:
         if not text:
             sys.exit(f"claude-agents: {args.prompt_file} is empty")
         meta["first_prompt"] = text
-    a = create(cfg, args.name, dir=args.dir, repo=args.repo, **meta)
+    # A new agent starts from the remote's current default branch, not the
+    # checkout's HEAD (a fork starts from its parent's HEAD instead).
+    base = remote_base(args.repo) if args.repo else None
+    a = create(cfg, args.name, dir=args.dir, repo=args.repo, base=base, **meta)
     print(f"Added {a.name} ({a.sid}); the supervisor starts it within {cfg.poll:.0f}s.")
 
 

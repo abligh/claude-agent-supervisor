@@ -144,6 +144,34 @@ def test_new_can_make_a_git_worktree(home: Path) -> None:
                           capture_output=True, text=True).stdout.strip() == "sre"
 
 
+def test_new_starts_from_the_remotes_main_not_a_stale_checkout(home: Path, tmp_path: Path) -> None:
+    """A checkout's HEAD is whatever a person last had there: DemoDev once
+    started from a main four days old. `new --repo` fetches and branches
+    from origin's default branch instead."""
+    upstream = _git_repo(tmp_path / "upstream")
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(upstream), str(clone)], check=True)
+    (upstream / "later.txt").write_text("x")
+    subprocess.run(["git", "-C", str(upstream), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(upstream), "commit", "-qm", "later"], check=True)
+    ca.cmd_new(_cfg(home), argparse.Namespace(name="sre", dir=None, repo=str(clone),
+                                              prompt_file=None))
+    a = ca.resolve(_cfg(home), "sre")
+    assert (a.worktree / "later.txt").exists()
+    upstream_head = subprocess.run(["git", "-C", str(upstream), "rev-parse", "HEAD"],
+                                   capture_output=True, text=True).stdout
+    assert subprocess.run(["git", "-C", str(a.worktree), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout == upstream_head
+
+
+def test_new_without_a_remote_uses_head(home: Path) -> None:
+    repo = _git_repo(home / "repo")
+    assert ca.remote_base(str(repo)) is None
+    a = ca.create(_cfg(home), "sre", repo=str(repo), base=ca.remote_base(str(repo)))
+    assert subprocess.run(["git", "-C", str(a.worktree), "branch", "--show-current"],
+                          capture_output=True, text=True).stdout.strip() == "sre"
+
+
 # --- what runs ---------------------------------------------------------------------
 
 
