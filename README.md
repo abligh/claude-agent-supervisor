@@ -123,6 +123,16 @@ more when the dialog goes. The command decides where alerts go: chat, mail, a
 push service (`config.example.env` sends them to a chat room). Answer the
 dialog with `claude-agents attach AGENT`.
 
+**A memory ceiling per agent.** An agent's tests run as its children, so
+one runaway test can take the whole host's memory and starve every other
+agent (one reached 38 GB in four minutes). With `AGENTS_MEMORY_MAX` set (e.g.
+`10G`), each agent runs in its own transient systemd scope with that
+`MemoryMax`, and swap capped, so the kernel kills the runaway inside that
+agent's scope and nothing else. It needs a user manager with the memory
+controller delegated; the supervisor tries a capped scope at startup and, if
+it can't make one, logs that and runs agents uncapped. A cap applies as each
+agent next starts (`claude-agents restart AGENT`).
+
 **Background forks.** Interrupting an agent at its terminal (Ctrl-C twice)
 while it has a background task running makes Claude Code offer "move to
 background and exit". That forks the session under Claude Code's daemon, and

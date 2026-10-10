@@ -781,3 +781,57 @@ def test_an_agent_can_have_its_own_model(home: Path) -> None:
     ca.cmd_new(_cfg(home), argparse.Namespace(name="Plain", dir=None, repo=None,
                                               prompt_file=None, model=None))
     assert "--model" not in ca.claude_args(ca.resolve(_cfg(home), "Plain"), _cfg(home))
+
+
+# --- the memory cap -----------------------------------------------------------------
+
+
+def test_config_reads_the_memory_cap(tmp_path: Path) -> None:
+    conf = tmp_path / "config.env"
+    conf.write_text("AGENTS_MEMORY_MAX=12G\n")
+    cfg = ca.load_config(conf)
+    assert cfg.memory_max == "12G" and "AGENTS_MEMORY_MAX" not in cfg.session_env
+    assert ca.load_config(tmp_path / "absent.env").memory_max == ""
+
+
+def test_an_agent_runs_in_a_capped_scope_only_when_the_probe_passed(home: Path) -> None:
+    a = _agent(home, "builder")
+    assert ca.memory_args(a, _cfg(home)) == []
+    assert ca.memory_args(a, _cfg(home, memory_max="12G")) == []  # not probed
+    prefix = ca.memory_args(a, _cfg(home, memory_max="12G", memory_capped=True))
+    assert prefix[:3] == ["systemd-run", "--user", "--scope"]
+    assert "MemoryMax=12G" in prefix and "MemorySwapMax=0" in prefix
+    assert prefix[-1] == "--"
+
+
+def test_start_runs_claude_inside_the_scope(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    a = _agent(home, "builder")
+    calls = []
+    monkeypatch.setattr(ca, "tmux", lambda *args: calls.append(args)
+                        or subprocess.CompletedProcess(args, 0, "", ""))
+    monkeypatch.setattr(ca, "pane", lambda name: None)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    ca.start(a, _cfg(home, memory_max="8G", memory_capped=True))
+    (args,) = [c for c in calls if c[0] == "new-session"]
+    command = list(args[args.index("--") + 1:])
+    assert command[0] == "claude" and "MemoryMax=8G" in args
+    assert args.index("systemd-run") < args.index("--")
+    assert f"XDG_RUNTIME_DIR=/run/user/{os.getuid()}" in args
+
+
+def test_a_failed_probe_runs_agents_uncapped(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    def no_bus(*a, **kw):
+        return subprocess.CompletedProcess(a, 1, "", "Failed to connect to bus")
+    monkeypatch.setattr(ca.subprocess, "run", no_bus)
+    assert ca.probe_memory_cap(ca.Config(root=Path("/x"), memory_max="12G")) is False
+    assert "not applied: systemd-run says Failed to connect to bus" in capsys.readouterr().out
+    assert ca.probe_memory_cap(ca.Config(root=Path("/x"))) is False
+
+
+def test_a_passing_probe_says_so(monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    seen = []
+    monkeypatch.setattr(ca.subprocess, "run", lambda args, **kw: seen.append((args, kw))
+                        or subprocess.CompletedProcess(args, 0, "", ""))
+    assert ca.probe_memory_cap(ca.Config(root=Path("/x"), memory_max="12G")) is True
+    assert "MemoryMax=12G" in seen[0][0] and "XDG_RUNTIME_DIR" in seen[0][1]["env"]
+    assert "capped at 12G" in capsys.readouterr().out

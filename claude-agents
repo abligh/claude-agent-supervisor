@@ -98,6 +98,10 @@ class Config:
     alert_cmd: str = ""
     alert_after: float = 60.0
     host: str = ""
+    # Each agent's memory ceiling (systemd's MemoryMax, e.g. 12G), or "".
+    memory_max: str = ""
+    # Whether a capped scope can be made here: set by Supervisor.run's probe.
+    memory_capped: bool = False
 
     @property
     def plugins(self) -> list[str]:
@@ -131,6 +135,7 @@ def load_config(path: Path | None = None) -> Config:
         alert_cmd=own.get("AGENTS_ALERT_CMD", ""),
         alert_after=float(own.get("AGENTS_ALERT_AFTER", "60")),
         host=own.get("AGENTS_HOST", "") or socket.gethostname().split(".")[0],
+        memory_max=own.get("AGENTS_MEMORY_MAX", "").strip(),
     )
 
 
@@ -275,6 +280,49 @@ def claude_args(agent: Agent, cfg: Config) -> list[str]:
             # the JSON as soon as that conversation exists (_follow).
             return args + cfg.extra_args + model_args(agent) + [agent.meta["first_prompt"]]
     return args + cfg.extra_args + model_args(agent)
+
+
+def user_bus_env() -> dict[str, str]:
+    """The environment `systemd-run --user` needs to find the user manager:
+    a system service (as the supervisor usually is) has no XDG_RUNTIME_DIR."""
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    return env
+
+
+def memory_args(agent: Agent, cfg: Config) -> list[str]:
+    """The prefix that runs an agent in its own transient systemd scope,
+    capped at AGENTS_MEMORY_MAX, so a runaway test it starts is OOM-killed
+    inside that scope instead of starving every other agent on the host.
+    systemd-run --scope execs the command, so the pane's process is still
+    claude, and SIGTERM still stops it cleanly. Swap is capped too, or a
+    runaway would page the host to a crawl before it hit the ceiling."""
+    if not (cfg.memory_max and cfg.memory_capped):
+        return []
+    return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+            "--description", f"claude agent {agent.name} ({agent.sid})",
+            "-p", f"MemoryMax={cfg.memory_max}", "-p", "MemorySwapMax=0", "--"]
+
+
+def probe_memory_cap(cfg: Config) -> bool:
+    """Whether capped scopes work here: a user manager with the memory
+    controller delegated. Without one, agents run uncapped and the log says
+    so, rather than every start failing."""
+    if not cfg.memory_max:
+        return False
+    try:
+        r = subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "--collect",
+                            "-p", f"MemoryMax={cfg.memory_max}", "true"],
+                           capture_output=True, text=True, env=user_bus_env(), timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"AGENTS_MEMORY_MAX={cfg.memory_max} not applied: {exc}")
+        return False
+    if r.returncode != 0:
+        log(f"AGENTS_MEMORY_MAX={cfg.memory_max} not applied: systemd-run says "
+            f"{r.stderr.strip() or 'exit %d' % r.returncode}")
+        return False
+    log(f"each agent's memory is capped at {cfg.memory_max}")
+    return True
 
 
 def model_args(agent: Agent) -> list[str]:
@@ -515,8 +563,11 @@ def stop(*names: str, wait: float = 20.0) -> None:
 
 def start(agent: Agent, cfg: Config) -> None:
     """Start (or restart) the agent in its tmux session, named by its session ID."""
-    env = [x for k, v in cfg.session_env.items() for x in ("-e", f"{k}={v}")]
-    args = claude_args(agent, cfg)
+    session_env = dict(cfg.session_env)
+    if memory_args(agent, cfg):
+        session_env.setdefault("XDG_RUNTIME_DIR", user_bus_env()["XDG_RUNTIME_DIR"])
+    env = [x for k, v in session_env.items() for x in ("-e", f"{k}={v}")]
+    args = memory_args(agent, cfg) + claude_args(agent, cfg)
     if pane(agent.sid) is not None:
         r = tmux("respawn-pane", "-k", "-t", f"={agent.sid}:", "-c", str(agent.real), *env, *args)
     else:
@@ -730,6 +781,7 @@ class Supervisor:
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, lambda *_: setattr(self, "stopping", True))
         log(f"supervising {self.cfg.root}")
+        self.cfg.memory_capped = probe_memory_cap(self.cfg)
         while not self.stopping:
             try:
                 self.tick()
