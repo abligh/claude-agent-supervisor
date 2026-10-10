@@ -801,6 +801,8 @@ def test_an_agent_runs_in_a_capped_scope_only_when_the_probe_passed(home: Path) 
     prefix = ca.memory_args(a, _cfg(home, memory_max="12G", memory_capped=True))
     assert prefix[:3] == ["systemd-run", "--user", "--scope"]
     assert "MemoryMax=12G" in prefix and "MemorySwapMax=0" in prefix
+    # Only the process that ran out dies, not the agent's whole scope.
+    assert prefix[prefix.index("OOMPolicy=continue") - 1] == "-p"
     assert prefix[-1] == "--"
 
 

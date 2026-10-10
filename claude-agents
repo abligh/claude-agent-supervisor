@@ -296,12 +296,19 @@ def memory_args(agent: Agent, cfg: Config) -> list[str]:
     inside that scope instead of starving every other agent on the host.
     systemd-run --scope execs the command, so the pane's process is still
     claude, and SIGTERM still stops it cleanly. Swap is capped too, or a
-    runaway would page the host to a crawl before it hit the ceiling."""
+    runaway would page the host to a crawl before it hit the ceiling.
+    OOMPolicy=continue kills only the process that ran out: under systemd's
+    default (stop) the whole scope goes, claude with it."""
     if not (cfg.memory_max and cfg.memory_capped):
         return []
     return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
             "--description", f"claude agent {agent.name} ({agent.sid})",
-            "-p", f"MemoryMax={cfg.memory_max}", "-p", "MemorySwapMax=0", "--"]
+            *scope_properties(cfg), "--"]
+
+
+def scope_properties(cfg: Config) -> list[str]:
+    return ["-p", f"MemoryMax={cfg.memory_max}", "-p", "MemorySwapMax=0",
+            "-p", "OOMPolicy=continue"]
 
 
 def probe_memory_cap(cfg: Config) -> bool:
@@ -312,7 +319,7 @@ def probe_memory_cap(cfg: Config) -> bool:
         return False
     try:
         r = subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "--collect",
-                            "-p", f"MemoryMax={cfg.memory_max}", "true"],
+                            *scope_properties(cfg), "true"],
                            capture_output=True, text=True, env=user_bus_env(), timeout=30)
     except (OSError, subprocess.TimeoutExpired) as exc:
         log(f"AGENTS_MEMORY_MAX={cfg.memory_max} not applied: {exc}")

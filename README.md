@@ -127,8 +127,9 @@ dialog with `claude-agents attach AGENT`.
 one runaway test can take the whole host's memory and starve every other
 agent (one reached 38 GB in four minutes). With `AGENTS_MEMORY_MAX` set (e.g.
 `10G`), each agent runs in its own transient systemd scope with that
-`MemoryMax`, and swap capped, so the kernel kills the runaway inside that
-agent's scope and nothing else. It needs a user manager with the memory
+`MemoryMax`, swap capped and `OOMPolicy=continue`, so the kernel kills the
+process that ran out and nothing else: not the agent's session, which
+systemd's default policy would stop along with it. It needs a user manager with the memory
 controller delegated; the supervisor tries a capped scope at startup and, if
 it can't make one, logs that and runs agents uncapped. A cap applies as each
 agent next starts (`claude-agents restart AGENT`).
