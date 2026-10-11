@@ -134,6 +134,15 @@ controller delegated; the supervisor tries a capped scope at startup and, if
 it can't make one, logs that and runs agents uncapped. A cap applies as each
 agent next starts (`claude-agents restart AGENT`).
 
+**A CPU weight per agent.** Every build or test an agent starts sizes
+itself to all the host's CPUs, so a few at once leave the host with far more
+runnable threads than cores, and everything else on it (a CI runner, say)
+gets a thin slice. With `AGENTS_CPU_WEIGHT` set (e.g. `25`; systemd's default
+is 100), each agent's scope gets that `CPUWeight`: under contention the CPUs
+are shared in proportion to weight instead. On an idle host it costs nothing.
+It uses the same scope as the memory ceiling, and applies as each agent
+next starts.
+
 **Background forks.** Interrupting an agent at its terminal (Ctrl-C twice)
 while it has a background task running makes Claude Code offer "move to
 background and exit". That forks the session under Claude Code's daemon, and

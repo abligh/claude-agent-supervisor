@@ -100,6 +100,8 @@ class Config:
     host: str = ""
     # Each agent's memory ceiling (systemd's MemoryMax, e.g. 12G), or "".
     memory_max: str = ""
+    # Each agent's CPU weight (systemd's CPUWeight, 1-10000), or "".
+    cpu_weight: str = ""
     # Whether a capped scope can be made here: set by Supervisor.run's probe.
     memory_capped: bool = False
 
@@ -136,6 +138,7 @@ def load_config(path: Path | None = None) -> Config:
         alert_after=float(own.get("AGENTS_ALERT_AFTER", "60")),
         host=own.get("AGENTS_HOST", "") or socket.gethostname().split(".")[0],
         memory_max=own.get("AGENTS_MEMORY_MAX", "").strip(),
+        cpu_weight=own.get("AGENTS_CPU_WEIGHT", "").strip(),
     )
 
 
@@ -298,8 +301,12 @@ def memory_args(agent: Agent, cfg: Config) -> list[str]:
     claude, and SIGTERM still stops it cleanly. Swap is capped too, or a
     runaway would page the host to a crawl before it hit the ceiling.
     OOMPolicy=continue kills only the process that ran out: under systemd's
-    default (stop) the whole scope goes, claude with it."""
-    if not (cfg.memory_max and cfg.memory_capped):
+    default (stop) the whole scope goes, claude with it. With
+    AGENTS_CPU_WEIGHT the scope also gets that CPUWeight, so a busy host
+    shares its CPUs between the agents and what else runs there (systemd's
+    default is 100) in proportion, instead of by how many threads each
+    starts; a weight costs nothing on an idle host."""
+    if not ((cfg.memory_max or cfg.cpu_weight) and cfg.memory_capped):
         return []
     return ["systemd-run", "--user", "--scope", "--quiet", "--collect",
             "--description", f"claude agent {agent.name} ({agent.sid})",
@@ -307,28 +314,39 @@ def memory_args(agent: Agent, cfg: Config) -> list[str]:
 
 
 def scope_properties(cfg: Config) -> list[str]:
-    return ["-p", f"MemoryMax={cfg.memory_max}", "-p", "MemorySwapMax=0",
-            "-p", "OOMPolicy=continue"]
+    props = []
+    if cfg.memory_max:
+        props += ["-p", f"MemoryMax={cfg.memory_max}", "-p", "MemorySwapMax=0",
+                  "-p", "OOMPolicy=continue"]
+    if cfg.cpu_weight:
+        props += ["-p", f"CPUWeight={cfg.cpu_weight}"]
+    return props
+
+
+def scope_settings(cfg: Config) -> str:
+    """The AGENTS_* settings a scope applies, for the log."""
+    return " ".join(f"{k}={v}" for k, v in (("AGENTS_MEMORY_MAX", cfg.memory_max),
+                                             ("AGENTS_CPU_WEIGHT", cfg.cpu_weight)) if v)
 
 
 def probe_memory_cap(cfg: Config) -> bool:
     """Whether capped scopes work here: a user manager with the memory
     controller delegated. Without one, agents run uncapped and the log says
     so, rather than every start failing."""
-    if not cfg.memory_max:
+    if not (cfg.memory_max or cfg.cpu_weight):
         return False
     try:
         r = subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "--collect",
                             *scope_properties(cfg), "true"],
                            capture_output=True, text=True, env=user_bus_env(), timeout=30)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        log(f"AGENTS_MEMORY_MAX={cfg.memory_max} not applied: {exc}")
+        log(f"{scope_settings(cfg)} not applied: {exc}")
         return False
     if r.returncode != 0:
-        log(f"AGENTS_MEMORY_MAX={cfg.memory_max} not applied: systemd-run says "
+        log(f"{scope_settings(cfg)} not applied: systemd-run says "
             f"{r.stderr.strip() or 'exit %d' % r.returncode}")
         return False
-    log(f"each agent's memory is capped at {cfg.memory_max}")
+    log(f"each agent runs in its own scope: {scope_settings(cfg)}")
     return True
 
 

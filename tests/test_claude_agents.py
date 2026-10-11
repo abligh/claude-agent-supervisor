@@ -836,4 +836,29 @@ def test_a_passing_probe_says_so(monkeypatch: pytest.MonkeyPatch, capsys) -> Non
                         or subprocess.CompletedProcess(args, 0, "", ""))
     assert ca.probe_memory_cap(ca.Config(root=Path("/x"), memory_max="12G")) is True
     assert "MemoryMax=12G" in seen[0][0] and "XDG_RUNTIME_DIR" in seen[0][1]["env"]
-    assert "capped at 12G" in capsys.readouterr().out
+    assert "own scope: AGENTS_MEMORY_MAX=12G" in capsys.readouterr().out
+
+
+def test_a_cpu_weight_alone_makes_a_weighted_scope(home: Path) -> None:
+    a = _agent(home, "builder")
+    prefix = ca.memory_args(a, _cfg(home, cpu_weight="25", memory_capped=True))
+    assert prefix[:3] == ["systemd-run", "--user", "--scope"]
+    assert prefix[prefix.index("CPUWeight=25") - 1] == "-p"
+    assert not any(p.startswith("Memory") for p in prefix)
+    both = ca.memory_args(a, _cfg(home, memory_max="12G", cpu_weight="25",
+                                  memory_capped=True))
+    assert "MemoryMax=12G" in both and "CPUWeight=25" in both
+
+
+def test_the_cpu_weight_is_read_and_probed(home: Path, monkeypatch: pytest.MonkeyPatch,
+                                           capsys) -> None:
+    path = home / "config.env"
+    path.write_text("AGENTS_CPU_WEIGHT=25\nCARGO_BUILD_JOBS=4\n")
+    cfg = ca.load_config(path)
+    assert cfg.cpu_weight == "25" and cfg.session_env == {"CARGO_BUILD_JOBS": "4"}
+    seen = []
+    monkeypatch.setattr(ca.subprocess, "run", lambda args, **kw: seen.append(args)
+                        or subprocess.CompletedProcess(args, 0, "", ""))
+    assert ca.probe_memory_cap(cfg) is True
+    assert "CPUWeight=25" in seen[0]
+    assert "AGENTS_CPU_WEIGHT=25" in capsys.readouterr().out
