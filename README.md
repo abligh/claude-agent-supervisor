@@ -75,6 +75,8 @@ claude-agents new NAME [--dir PATH | --repo PATH] [--prompt-file FILE] [--model 
                                             to PATH, or a new git worktree of PATH
                                             (FILE: its opening prompt, sent once)
                                             (MODEL: its own, on every start; "model" in its JSON)
+                                            ("env" in its JSON: its own environment
+                                            over config.env's, e.g. XMPP_AUTO_JOIN)
 claude-agents fork AGENT NAME [--dir PATH]  a new agent from a copy of AGENT's conversation
 claude-agents rename AGENT NAME
 claude-agents stop AGENT                    pause it; it stays stopped

@@ -13,7 +13,8 @@ session ID, which never changes:
     <session-id>.json       its name (kept in step with the session's own
                             name, so a rename anywhere shows up here) and
                             what the supervisor notes: stopped, a fork to
-                            start, where it was adopted from
+                            start, where it was adopted from; "model" and
+                            "env" (environment over config.env's) are its own
     <session-id>.worktree   where it works: a directory, a git worktree, or a
                             symlink to one anywhere
 
@@ -586,9 +587,22 @@ def stop(*names: str, wait: float = 20.0) -> None:
 
 
 
+def agent_env(agent: Agent, cfg: Config) -> dict[str, str]:
+    """The agent's environment: the host's (config.env, less AGENTS_*), then
+    "env" in its JSON, which wins, so one agent can join other rooms than the
+    host's XMPP_AUTO_JOIN, say. An empty value is passed as empty, which
+    unsets a list-valued setting; a value that isn't a string is ignored."""
+    env = dict(cfg.session_env)
+    own = agent.meta.get("env")
+    if isinstance(own, dict):
+        env.update({k: v for k, v in own.items()
+                    if isinstance(k, str) and isinstance(v, str) and not k.startswith("AGENTS_")})
+    return env
+
+
 def start(agent: Agent, cfg: Config) -> None:
     """Start (or restart) the agent in its tmux session, named by its session ID."""
-    session_env = dict(cfg.session_env)
+    session_env = agent_env(agent, cfg)
     if memory_args(agent, cfg):
         session_env.setdefault("XDG_RUNTIME_DIR", user_bus_env()["XDG_RUNTIME_DIR"])
     env = [x for k, v in session_env.items() for x in ("-e", f"{k}={v}")]

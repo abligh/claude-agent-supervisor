@@ -783,6 +783,25 @@ def test_an_agent_can_have_its_own_model(home: Path) -> None:
     assert "--model" not in ca.claude_args(ca.resolve(_cfg(home), "Plain"), _cfg(home))
 
 
+def test_an_agent_can_have_its_own_environment(home: Path) -> None:
+    """"env" in its JSON over the host's: another agent keeps the host's,
+    and nothing in it can reach the supervisor's own AGENTS_* settings."""
+    cfg = _cfg(home)
+    cfg.session_env = {"XMPP_AUTO_JOIN": "everyone@conference.example", "X": "1"}
+    other = _agent(home, "builder")
+    a = _agent(home, "loner")
+    a.update(env={"XMPP_AUTO_JOIN": "loner@conference.example", "Y": "2",
+                  "AGENTS_ROOT": "/elsewhere", "BAD": 3})
+    a = ca.resolve(cfg, "loner")
+    assert ca.agent_env(a, cfg) == {"XMPP_AUTO_JOIN": "loner@conference.example",
+                                    "X": "1", "Y": "2"}
+    assert ca.agent_env(other, cfg) == cfg.session_env
+    a.update(env={"XMPP_AUTO_JOIN": ""})
+    assert ca.agent_env(ca.resolve(cfg, "loner"), cfg)["XMPP_AUTO_JOIN"] == ""
+    a.update(env="not a mapping")
+    assert ca.agent_env(ca.resolve(cfg, "loner"), cfg) == cfg.session_env
+
+
 # --- the memory cap -----------------------------------------------------------------
 
 
