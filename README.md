@@ -145,6 +145,15 @@ are shared in proportion to weight instead. On an idle host it costs nothing.
 It uses the same scope as the memory ceiling, and applies as each agent
 next starts.
 
+**Remote Control after a login change.** When the machine's claude.ai login
+changes (a new plan, logging out and in), every session's Remote Control drops
+with "Remote Control disconnected … run /remote-control". The supervisor
+watches for that line in each agent's terminal and, once the agent is idle,
+types `/remote-control` for it (at most every 10 minutes per agent), which
+reconnects it to the account now logged in. Each start clears the pane's
+scrollback, so a line left by the previous process isn't taken for the new
+one's.
+
 **Background forks.** Interrupting an agent at its terminal (Ctrl-C twice)
 while it has a background task running makes Claude Code offer "move to
 background and exit". That forks the session under Claude Code's daemon, and

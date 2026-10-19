@@ -224,6 +224,48 @@ def test_the_json_follows_the_sessions_name(home: Path, monkeypatch) -> None:
     assert ca.resolve(_cfg(home), a.sid).name == "claude-dev2"
 
 
+def test_remote_control_lost_reads_the_last_word() -> None:
+    assert not ca.remote_control_lost(None)
+    assert not ca.remote_control_lost("all well")
+    lost = "● Remote Control disconnected — signed-in claude.ai account changed\n"
+    back = "  /remote-control is active · Continue here\n"
+    assert ca.remote_control_lost("x\n" + lost)
+    assert not ca.remote_control_lost(lost + back)
+    assert ca.remote_control_lost(back + lost)
+
+
+def test_a_disconnected_idle_session_gets_remote_control_typed(home: Path, monkeypatch,
+                                                              no_tmux) -> None:
+    a = _agent(home, "reviewer")
+    live = {"sessionId": a.sid, "name": "reviewer", "status": "busy"}
+    monkeypatch.setattr(ca, "live_session", lambda pid: live)
+    text = ["● Remote Control disconnected — run /remote-control\n"]
+    monkeypatch.setattr(ca, "history", lambda name, lines=2000: text[0])
+    sup = ca.Supervisor(_cfg(home))
+    typed = ("send-keys", "-t", f"={a.sid}:", "-l", "/remote-control")
+    sup._follow(a, ca.Pane(False, 1, ""))
+    assert typed not in no_tmux  # busy: it would queue behind the turn
+    live["status"] = "idle"
+    sup._follow(a, ca.Pane(False, 1, ""))
+    assert no_tmux.count(typed) == 1
+    sup._follow(a, ca.Pane(False, 1, ""))
+    assert no_tmux.count(typed) == 1  # not again within RC_RETRY_S
+    sup.rc_typed[a.sid] -= ca.RC_RETRY_S
+    text[0] += "  /remote-control is active\n"
+    sup._follow(a, ca.Pane(False, 1, ""))
+    assert no_tmux.count(typed) == 1  # reconnected: nothing to do
+
+
+def test_a_start_forgets_the_previous_processs_screen(home: Path, monkeypatch,
+                                                       no_tmux) -> None:
+    a = _agent(home, "reviewer")
+    monkeypatch.setattr(ca, "tmux", lambda *args: no_tmux.append(args)
+                        or subprocess.CompletedProcess(args, 0, "", ""))
+    monkeypatch.setattr(ca, "pane", lambda name: ca.Pane(True, 1, ""))
+    ca.start(a, _cfg(home))
+    assert ("clear-history", "-t", f"={a.sid}:") in no_tmux
+
+
 def test_rename_while_stopped_waits_for_the_next_start(home: Path) -> None:
     a = _agent(home, "old")
     _conversation(a.real, a.sid, titles=("old",))

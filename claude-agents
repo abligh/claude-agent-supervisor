@@ -63,6 +63,11 @@ NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
 SID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 LINK_RE = re.compile(r"https://claude\.ai/code/session_[A-Za-z0-9]+")
 QUICK_EXIT_S = 60  # an agent that dies sooner than this counts as failing to start
+# Remote Control drops when the machine's claude.ai login changes (a new plan,
+# a re-login); Claude Code says so and waits for /remote-control.
+RC_LOST = "Remote Control disconnected"
+RC_ACTIVE = "/remote-control is active"
+RC_RETRY_S = 600  # between two /remote-control typed into one session
 
 
 def _home() -> Path:
@@ -614,6 +619,9 @@ def start(agent: Agent, cfg: Config) -> None:
                  "-c", str(agent.real), *env, *args)
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or f"tmux exited {r.returncode}")
+    # A respawned pane keeps the old process's scrollback: what it said about
+    # Remote Control must not be read as this one's.
+    tmux("clear-history", "-t", f"={agent.sid}:")
     how = ("resuming" if "--fork-session" not in args and "--resume" in args
            else "forking " + agent.meta["fork_from"] if "--fork-session" in args
            else "new conversation")
@@ -636,6 +644,20 @@ def screen(name: str) -> str | None:
     """The visible text of the agent's terminal, or None."""
     r = tmux("capture-pane", "-p", "-t", f"={name}:")
     return r.stdout if r.returncode == 0 else None
+
+
+def history(name: str, lines: int = 2000) -> str | None:
+    """The agent's terminal with its recent scrollback, wrapped lines joined."""
+    r = tmux("capture-pane", "-p", "-J", "-S", f"-{lines}", "-t", f"={name}:")
+    return r.stdout if r.returncode == 0 else None
+
+
+def remote_control_lost(text: str | None) -> bool:
+    """Whether the session last said its Remote Control was disconnected,
+    with nothing since saying it is active again."""
+    if not text:
+        return False
+    return text.rfind(RC_LOST) > text.rfind(RC_ACTIVE)
 
 
 def waiting_prompt(text: str | None) -> str | None:
@@ -699,6 +721,7 @@ class Supervisor:
         self.waiting: dict[str, Waiting] = {}
         self.window_names: dict[str, str] = {}
         self.forks_reported: set[str] = set()
+        self.rc_typed: dict[str, float] = {}
         self.stopping = False
 
     def tick(self) -> None:
@@ -813,6 +836,21 @@ class Supervisor:
             agent.update(fork_from=None)
         if agent.meta.get("first_prompt") and has_transcript(agent.real, agent.sid):
             agent.update(first_prompt=None)
+        self._reconnect(agent, live)
+
+    def _reconnect(self, agent: Agent, live: dict) -> None:
+        """Type /remote-control into a session whose Remote Control dropped,
+        once it is idle (so it isn't queued behind a turn), at most every
+        RC_RETRY_S. Claude Code reconnects it to the account now logged in."""
+        now = time.monotonic()
+        if live.get("status") != "idle" or now < self.rc_typed.get(agent.sid, -RC_RETRY_S) + RC_RETRY_S:
+            return
+        if not remote_control_lost(history(agent.sid)):
+            return
+        self.rc_typed[agent.sid] = now
+        tmux("send-keys", "-t", f"={agent.sid}:", "-l", "/remote-control")
+        tmux("send-keys", "-t", f"={agent.sid}:", "Enter")
+        log(f"{agent.name}: Remote Control was disconnected; typed /remote-control")
 
     def run(self) -> None:
         write_tmux_conf()
